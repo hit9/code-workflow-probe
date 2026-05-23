@@ -29,6 +29,61 @@ code-workflow-probe sync --root . --format json
 
 Use `--verbose` when you need full evidence and fingerprints.
 
+## Python API
+
+```python
+from code_workflow_probe import affected, edit, install_skill, status, sync
+```
+
+APIs return concise text by default. Pass `format="json"` to get dictionaries.
+
+```python
+sync(root=".", cache_path=None, changed_files=None, write=True, format="text", verbose=False)
+```
+
+Build an aligned profile and optionally write the cache.
+
+```python
+status(root=".", cache_path=None, format="text", verbose=False)
+```
+
+Check whether the cached profile still matches current evidence files.
+
+```python
+edit(root=".", changed_files=None, cache_path=None, format="text", verbose=False)
+```
+
+Notify changed files; resync if the changes affect workflow evidence.
+
+```python
+affected(root=".", changed_files=None, cache_path=None, format="text", verbose=False)
+```
+
+Map changed files to affected components and suggested local workflows.
+
+```python
+install_skill(tool="codex", skills_dir=None, dry_run=False, overwrite=True, format="text", verbose=False)
+```
+
+Install the Codex skill.
+
+### API Examples
+
+```python
+import code_workflow_probe as cwp
+
+print(cwp.sync("."))
+
+profile = cwp.sync(".", format="json")
+if profile["alignment"]["aligned"]:
+    print(profile["project"]["components"])
+
+result = cwp.affected(".", ["src/app.py"], format="json")
+for workflow in result["suggested_workflows"]:
+    if workflow["safe_auto"]:
+        print(workflow["cwd"], workflow["command"])
+```
+
 ## Codex Skill
 
 ```bash
