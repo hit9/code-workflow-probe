@@ -35,21 +35,33 @@ Use `sync --changed ...` for incremental cache reuse after known file edits:
 code-workflow-probe sync --root . --changed src/app.py
 ```
 
+Use `--paths-only` when you want sync to trust only the explicit changed paths plus the existing cache, without discovering the whole repo:
+
+```bash
+code-workflow-probe sync --root . --changed pyproject.toml --paths-only
+```
+
 Use `--progress` to print sync progress to stderr, and `--full` to force a full scan.
 
 ## Python API
 
 ```python
-from code_workflow_probe import affected, edit, install_skill, status, sync
+from code_workflow_probe import affected, edit, install_skill, status, sync, sync_async
 ```
 
 APIs return concise text by default. Pass `format="json"` to get dictionaries.
 
 ```python
-sync(root=".", cache_path=None, changed_files=None, write=True, format="text", verbose=False, incremental=True, progress=None)
+sync(root=".", cache_path=None, changed_files=None, write=True, format="text", verbose=False, incremental=True, paths_only=False, progress=None)
 ```
 
-Build an aligned profile and optionally write the cache. With `changed_files`, it can reuse an aligned cache when the changes do not affect profile evidence.
+Build an aligned profile and optionally write the cache. With `changed_files`, it can reuse an aligned cache when the changes do not affect profile evidence. With `paths_only=True`, it avoids whole-repo discovery and updates only from explicit changed paths plus the existing cache.
+
+```python
+sync_async(root=".", cache_path=None, changed_files=None, write=True, format="text", verbose=False, incremental=True, paths_only=False, progress=None, executor=None)
+```
+
+Run `sync` in a background thread and return a `concurrent.futures.Future`. If `executor` is omitted, a one-shot thread pool is created and shut down after completion.
 
 ```python
 status(root=".", cache_path=None, format="text", verbose=False)
@@ -90,6 +102,9 @@ result = cwp.affected(".", ["src/app.py"], format="json")
 for workflow in result["suggested_workflows"]:
     if workflow["safe_auto"]:
         print(workflow["cwd"], workflow["command"])
+
+future = cwp.sync_async(".", format="json")
+profile = future.result(timeout=30)
 ```
 
 ## Codex Skill

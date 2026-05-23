@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import code_workflow_probe as probe
@@ -75,6 +76,7 @@ def test_api_default_format_is_text_and_json_format_returns_dict(tmp_path):
     text = probe.sync(tmp_path, cache)
     data = probe.sync(tmp_path, cache, format="json")
     status_text = probe.status(tmp_path, cache)
+    verbose_status = probe.status(tmp_path, cache, verbose=True)
     verbose_text = probe.sync(tmp_path, cache, verbose=True)
 
     assert isinstance(text, str)
@@ -87,6 +89,10 @@ def test_api_default_format_is_text_and_json_format_returns_dict(tmp_path):
     assert data["alignment"]["aligned"] is True
     assert isinstance(status_text, str)
     assert "status: aligned=true" in status_text
+    assert "profile: type=multi-component components=2" in status_text
+    assert "workflows: safe_auto=" in status_text
+    assert "id=app" not in status_text
+    assert "id=app" in verbose_status
     assert "evidence_files:" in verbose_text
     assert "sha256=" in verbose_text
 
@@ -173,6 +179,103 @@ def test_sync_incremental_reuses_cache_for_non_profile_changes(tmp_path):
     assert rebuilt["project"] != first["project"]
 
 
+def test_sync_async_returns_future_and_runs_sync(tmp_path):
+    cache = make_mixed_repo(tmp_path)
+    events = []
+
+    future = probe.sync_async(tmp_path, cache, format="json", progress=events.append)
+    profile = future.result(timeout=5)
+
+    assert profile["alignment"]["aligned"] is True
+    assert profile["project"]["type"] == "multi-component"
+    assert "sync: start" in events
+    assert "sync: done" in events
+
+
+def test_sync_async_accepts_custom_executor(tmp_path):
+    cache = make_mixed_repo(tmp_path)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = probe.sync_async(tmp_path, cache, format="json", executor=executor)
+        profile = future.result(timeout=5)
+
+    assert profile["alignment"]["aligned"] is True
+
+
+def test_sync_paths_only_updates_profile_file_without_repo_discovery(tmp_path, monkeypatch):
+    cache = make_mixed_repo(tmp_path)
+    first = probe.sync(tmp_path, cache, format="json")
+
+    def fail_discovery(*args, **kwargs):
+        raise AssertionError("paths-only sync should not discover the whole repo")
+
+    def fail_source_summary(*args, **kwargs):
+        raise AssertionError("paths-only sync should not scan source summary")
+
+    monkeypatch.setattr(probe, "_discover_profile_files", fail_discovery)
+    monkeypatch.setattr(probe, "_source_summary", fail_source_summary)
+
+    write(tmp_path / "app" / "package.json", json.dumps({"scripts": {"test": "vitest run"}, "packageManager": "pnpm@9.0.0"}))
+    updated = probe.sync(
+        tmp_path,
+        cache,
+        changed_files=["app/package.json"],
+        paths_only=True,
+        format="json",
+    )
+
+    app = component(updated, "app")
+    assert first["project"] != updated["project"]
+    assert updated["alignment"]["reason"] == "paths_only_synced"
+    assert [item["kind"] for item in app["workflows"]] == ["install", "test"]
+
+
+def test_sync_paths_only_requires_existing_cache(tmp_path):
+    result = probe.sync(
+        tmp_path,
+        tmp_path / "cache.json",
+        changed_files=["pyproject.toml"],
+        paths_only=True,
+        format="json",
+    )
+
+    assert result["alignment"]["aligned"] is False
+    assert result["alignment"]["reason"] == "cache_missing_paths_only"
+    assert result["profile"] is None
+
+
+def test_manifest_sync_and_status_do_not_require_source_summary_scan(tmp_path, monkeypatch):
+    cache = make_mixed_repo(tmp_path)
+
+    def fail_source_summary(root):
+        raise AssertionError("source summary should not be scanned for manifest repos")
+
+    monkeypatch.setattr(probe, "_source_summary", fail_source_summary)
+
+    profile = probe.sync(tmp_path, cache, format="json", incremental=False)
+    status = probe.status(tmp_path, cache, format="json")
+
+    assert profile["alignment"]["aligned"] is True
+    assert status["alignment"]["aligned"] is True
+
+
+def test_edit_and_affected_use_incremental_cache_before_status_scan(tmp_path, monkeypatch):
+    cache = make_mixed_repo(tmp_path)
+    probe.sync(tmp_path, cache, format="json")
+
+    def fail_status(*args, **kwargs):
+        raise AssertionError("status should not run for non-profile changed files")
+
+    monkeypatch.setattr(probe, "status", fail_status)
+
+    edited = probe.edit(tmp_path, ["app/src/main.ts"], cache, format="json")
+    affected = probe.affected(tmp_path, ["app/src/main.ts"], cache, format="json")
+
+    assert edited["profile_updated"] is False
+    assert edited["alignment"]["reason"] == "incremental_reuse"
+    assert affected["alignment"]["reason"] == "incremental_reuse"
+
+
 def test_cli_progress_uses_stderr(tmp_path):
     cache = make_mixed_repo(tmp_path)
     script = Path(probe.__file__).resolve()
@@ -205,8 +308,9 @@ def test_cli_progress_uses_stderr(tmp_path):
     )
 
     assert json.loads(result.stdout)["alignment"]["reason"] == "incremental_reuse"
-    assert "sync: start" in result.stderr
-    assert "sync: reused cached profile" in result.stderr
+    assert "cwp [" in result.stderr
+    assert "100% done" in result.stderr
+    assert "sync: start" not in result.stderr
 
 
 def test_affected_maps_files_to_components_and_local_workflows(tmp_path):
@@ -263,6 +367,10 @@ def test_install_skill_api_and_cli(tmp_path):
     assert not skill_path.exists()
     assert "after editing project or workflow management files" in dry_run["content"]
     assert "code-workflow-probe sync --root <repo>" in dry_run["content"]
+    assert "--paths-only" in dry_run["content"]
+    assert "--full" in dry_run["content"]
+    assert "--progress" in dry_run["content"]
+    assert "changed path list is complete" in dry_run["content"]
 
     installed = probe.install_skill(skills_dir=skills_dir, format="json")
     assert installed["installed"] is True

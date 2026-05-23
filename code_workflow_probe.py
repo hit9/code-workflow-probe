@@ -2,7 +2,8 @@
 """code-workflow-probe: deterministic repo workflow profile syncer.
 
 API:
-    sync(root=".", cache_path=None, changed_files=None, write=True, format="text", verbose=False, incremental=True, progress=None)
+    sync(root=".", cache_path=None, changed_files=None, write=True, format="text", verbose=False, incremental=True, paths_only=False, progress=None)
+    sync_async(root=".", cache_path=None, changed_files=None, write=True, format="text", verbose=False, incremental=True, paths_only=False, progress=None, executor=None)
     status(root=".", cache_path=None, format="text", verbose=False)
     edit(root=".", changed_files=None, cache_path=None, format="text", verbose=False)
     affected(root=".", changed_files=None, cache_path=None, format="text", verbose=False)
@@ -19,12 +20,15 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import copy
 import fnmatch
 import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,7 +40,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback.
     tomllib = None  # type: ignore[assignment]
 
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 SCHEMA_VERSION = 1
 DEFAULT_CACHE_NAME = ".code-workflow-probe.json"
 SKILL_NAME = "code-workflow-probe"
@@ -220,6 +224,7 @@ def sync(
     format: str = "text",
     verbose: bool = False,
     incremental: bool = True,
+    paths_only: bool = False,
     progress: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any] | str:
     """Build an aligned workflow profile and optionally write it to cache."""
@@ -241,6 +246,15 @@ def sync(
             _emit_progress(progress, "sync: done")
             return _format_result(reused, format, verbose=verbose)
 
+    if paths_only:
+        _emit_progress(progress, "sync: paths-only")
+        profile = _sync_paths_only(root_path, cache, _load_json(cache), normalized)
+        if write and profile.get("project") is not None:
+            _write_json(cache, profile)
+            _emit_progress(progress, "sync: wrote cache")
+        _emit_progress(progress, "sync: done")
+        return _format_result(profile, format, verbose=verbose)
+
     _emit_progress(progress, "sync: scan repo")
     builder = _ProfileBuilder(root_path, cache)
     profile = builder.build(changed_files=normalized)
@@ -249,6 +263,40 @@ def sync(
         _emit_progress(progress, "sync: wrote cache")
     _emit_progress(progress, "sync: done")
     return _format_result(profile, format, verbose=verbose)
+
+
+def sync_async(
+    root: str | os.PathLike[str] = ".",
+    cache_path: str | os.PathLike[str] | None = None,
+    changed_files: Optional[Sequence[str]] = None,
+    write: bool = True,
+    format: str = "text",
+    verbose: bool = False,
+    incremental: bool = True,
+    paths_only: bool = False,
+    progress: Optional[Callable[[str], None]] = None,
+    executor: Optional[Executor] = None,
+) -> Future:
+    """Run sync in a background thread and return a Future."""
+
+    kwargs = {
+        "root": root,
+        "cache_path": cache_path,
+        "changed_files": changed_files,
+        "write": write,
+        "format": format,
+        "verbose": verbose,
+        "incremental": incremental,
+        "paths_only": paths_only,
+        "progress": progress,
+    }
+    if executor is not None:
+        return executor.submit(sync, **kwargs)
+
+    local_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="code-workflow-probe-sync")
+    future = local_executor.submit(sync, **kwargs)
+    future.add_done_callback(lambda _: local_executor.shutdown(wait=False))
+    return future
 
 
 def status(
@@ -322,6 +370,25 @@ def edit(
     root_path = _resolve_root(root)
     cache = _resolve_cache_path(root_path, cache_path)
     normalized = _normalize_changed_files(root_path, changed_files or [])
+    cached = _load_json(cache)
+    reused = _try_incremental_sync(root_path, cache, cached, normalized)
+    if reused is not None:
+        affected_result = _affected_from_profile(root_path, reused, normalized)
+        return _format_result({
+            "operation": "edit",
+            "tool": "code-workflow-probe",
+            "schema_version": SCHEMA_VERSION,
+            "root": str(root_path),
+            "cache_path": str(cache),
+            "changed_files": normalized,
+            "profile_updated": False,
+            "alignment": reused["alignment"],
+            "affected": affected_result["affected"],
+            "suggested_workflows": affected_result["suggested_workflows"],
+            "profile": reused,
+            "warnings": affected_result["warnings"],
+        }, format, verbose=verbose)
+
     current_status = status(root_path, cache, format="json")
     profile_updated = False
 
@@ -363,6 +430,23 @@ def affected(
     root_path = _resolve_root(root)
     cache = _resolve_cache_path(root_path, cache_path)
     normalized = _normalize_changed_files(root_path, changed_files or [])
+    cached = _load_json(cache)
+    reused = _try_incremental_sync(root_path, cache, cached, normalized)
+    if reused is not None:
+        result = _affected_from_profile(root_path, reused, normalized)
+        return _format_result({
+            "operation": "affected",
+            "tool": "code-workflow-probe",
+            "schema_version": SCHEMA_VERSION,
+            "root": str(root_path),
+            "cache_path": str(cache),
+            "changed_files": normalized,
+            "alignment": reused["alignment"],
+            "affected": result["affected"],
+            "suggested_workflows": result["suggested_workflows"],
+            "warnings": result["warnings"],
+        }, format, verbose=verbose)
+
     current_status = status(root_path, cache, format="json")
 
     if current_status["alignment"]["aligned"]:
@@ -459,19 +543,32 @@ class _EvidenceStore:
 
 
 class _ProfileBuilder:
-    def __init__(self, root: Path, cache_path: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        cache_path: Path,
+        profile_files: Optional[Sequence[str]] = None,
+        allow_source_scan: bool = True,
+    ) -> None:
         self.root = root
         self.cache_path = cache_path
+        self.profile_files = list(profile_files) if profile_files is not None else None
+        self.allow_source_scan = allow_source_scan
         self.ignore = _GitIgnore(root)
         self.evidence = _EvidenceStore(root)
         self.warnings: List[str] = []
 
     def build(self, changed_files: Optional[Sequence[str]] = None) -> Dict[str, Any]:
-        profile_files = _discover_profile_files(self.root, self.cache_path)
+        profile_files = self.profile_files if self.profile_files is not None else _discover_profile_files(self.root, self.cache_path)
         self.evidence.add_many(profile_files, "profile_watch")
-        source_summary = _source_summary(self.root)
+        source_summary = _empty_source_summary()
         component_roots = self._component_roots(profile_files, source_summary)
+        if not component_roots and self.allow_source_scan:
+            source_summary = _source_summary(self.root)
+            component_roots = self._component_roots(profile_files, source_summary)
         components = [self._build_component(path, component_roots) for path in component_roots]
+        if not source_summary["languages"]:
+            source_summary = _component_language_summary(components)
         repo_workflows = self._repo_workflows(components)
         ci_workflows = self._ci_workflows(profile_files)
         technologies = _merge_facts(component.get("languages", []) + component.get("frameworks", []) for component in components)
@@ -582,7 +679,7 @@ class _ProfileBuilder:
             package_manager = package_manager or java["package_manager"]
             workflows.extend(java["workflows"])
 
-        if not languages:
+        if not languages and self.allow_source_scan:
             fallback = self._source_fallback_component(path, all_roots)
             languages.extend(fallback["languages"])
             evidence.extend(fallback["evidence"])
@@ -814,6 +911,8 @@ class _ProfileBuilder:
                 evidence.append(self.evidence.add(_join_rel(path, name), "typescript_config"))
         if evidence:
             return evidence
+        if not self.allow_source_scan:
+            return []
 
         ignored_roots = [
             candidate
@@ -1214,10 +1313,123 @@ def _try_incremental_sync(
     return profile
 
 
+def _sync_paths_only(
+    root: Path,
+    cache_path: Path,
+    cached: Optional[Dict[str, Any]],
+    changed_files: Sequence[str],
+) -> Dict[str, Any]:
+    if not cached:
+        return _paths_only_unavailable(root, cache_path, changed_files, "cache_missing_paths_only", "Path-only sync requires an existing cache.")
+    if not changed_files:
+        return _paths_only_unavailable(root, cache_path, changed_files, "changed_files_required", "Path-only sync requires changed_files.")
+    if cached.get("schema_version") != SCHEMA_VERSION or cached.get("root") != str(root):
+        return _paths_only_unavailable(root, cache_path, changed_files, "cache_incompatible", "Cached profile is not compatible with this repo.")
+    if not cached.get("alignment", {}).get("aligned"):
+        return _paths_only_unavailable(root, cache_path, changed_files, "cache_not_aligned", "Path-only sync requires an aligned cache.")
+
+    reused = _try_incremental_sync(root, cache_path, cached, changed_files)
+    if reused is not None:
+        return reused
+
+    ignore = _GitIgnore(root)
+    profile_files = {
+        rel
+        for rel in cached.get("watch", {}).get("files", {})
+        if _is_profile_file(rel) and _visible_file(root, ignore, rel)
+    }
+    profile_changed = False
+    watched_non_profile_changed = False
+    for changed in changed_files:
+        if ignore.ignored(changed, is_dir=False):
+            profile_files.discard(changed)
+            continue
+        language = SOURCE_EXTENSIONS.get(Path(changed).suffix)
+        if language and language not in set(cached.get("watch", {}).get("source_summary", {}).get("languages", [])):
+            return _paths_only_unavailable(root, cache_path, changed_files, "new_source_language_paths_only", "Changed files introduce a source language not present in cache; run full sync.")
+        if _is_profile_file(changed):
+            profile_changed = True
+            if _visible_file(root, ignore, changed):
+                profile_files.add(changed)
+            else:
+                profile_files.discard(changed)
+        elif changed in cached.get("watch", {}).get("files", {}):
+            watched_non_profile_changed = True
+
+    if not profile_changed and watched_non_profile_changed:
+        profile = copy.deepcopy(cached)
+        _refresh_changed_fingerprints(root, ignore, profile, changed_files)
+        _mark_synced(profile, cache_path, changed_files, "paths_only_synced")
+        return profile
+
+    builder = _ProfileBuilder(root, cache_path, profile_files=sorted(profile_files), allow_source_scan=False)
+    profile = builder.build(changed_files=changed_files)
+    profile["alignment"]["reason"] = "paths_only_synced"
+    return profile
+
+
+def _refresh_changed_fingerprints(root: Path, ignore: "_GitIgnore", profile: Dict[str, Any], changed_files: Sequence[str]) -> None:
+    for rel in changed_files:
+        if rel not in profile.get("watch", {}).get("files", {}) and rel not in profile.get("evidence_files", {}):
+            continue
+        if ignore.ignored(rel, is_dir=False) or not (root / rel).is_file():
+            profile.get("watch", {}).get("files", {}).pop(rel, None)
+            profile.get("evidence_files", {}).pop(rel, None)
+            continue
+        fingerprint = _fingerprint_with_rel(root, rel)
+        if rel in profile.get("watch", {}).get("files", {}):
+            profile["watch"]["files"][rel] = fingerprint
+        if rel in profile.get("evidence_files", {}):
+            roles = profile["evidence_files"][rel].get("roles", [])
+            profile["evidence_files"][rel] = dict(fingerprint, roles=roles)
+
+
+def _mark_synced(profile: Dict[str, Any], cache_path: Path, changed_files: Sequence[str], reason: str) -> None:
+    profile["generated_at"] = _utc_now()
+    profile["cache_path"] = str(cache_path)
+    profile["changed_files"] = list(changed_files)
+    profile["alignment"] = {
+        "aligned": True,
+        "reason": reason,
+        "checked_at": _utc_now(),
+        "stale_files": [],
+        "new_profile_files": [],
+        "removed_profile_files": [],
+        "source_summary_changed": False,
+    }
+
+
+def _paths_only_unavailable(
+    root: Path,
+    cache_path: Path,
+    changed_files: Sequence[str],
+    reason: str,
+    warning: str,
+) -> Dict[str, Any]:
+    return {
+        "operation": "sync",
+        "tool": "code-workflow-probe",
+        "schema_version": SCHEMA_VERSION,
+        "root": str(root),
+        "cache_path": str(cache_path),
+        "changed_files": list(changed_files),
+        "alignment": {
+            "aligned": False,
+            "reason": reason,
+            "checked_at": _utc_now(),
+            "stale_files": [],
+            "new_profile_files": [],
+            "removed_profile_files": [],
+            "source_summary_changed": False,
+        },
+        "profile": None,
+        "warnings": [warning],
+    }
+
+
 def _compare_watch_state(root: Path, cache_path: Path, watch: Dict[str, Any]) -> Dict[str, Any]:
     cached_files = watch.get("files", {}) if isinstance(watch, dict) else {}
     current_profile_files = _discover_profile_files(root, cache_path)
-    current_source_summary = _source_summary(root)
     current_file_set = set(current_profile_files) | set(cached_files.keys())
     ignore = _GitIgnore(root)
     current_files = {
@@ -1233,13 +1445,11 @@ def _compare_watch_state(root: Path, cache_path: Path, watch: Dict[str, Any]) ->
         current_fp = current_files.get(rel, {})
         if cached_fp.get("sha256") != current_fp.get("sha256") or cached_fp.get("size") != current_fp.get("size"):
             stale_files.append(rel)
-    cached_source_summary = watch.get("source_summary", {})
-    source_summary_changed = current_source_summary.get("languages") != cached_source_summary.get("languages")
     return {
         "stale_files": stale_files,
         "new_profile_files": sorted(set(current_profile_files) - cached_file_set),
         "removed_profile_files": sorted(cached_file_set - current_existing_set),
-        "source_summary_changed": source_summary_changed,
+        "source_summary_changed": False,
     }
 
 
@@ -1275,6 +1485,22 @@ def _source_summary(root: Path) -> Dict[str, Any]:
         "language_counts": dict(sorted(counts.items())),
         "samples": [sample for _, values in sorted(samples.items()) for sample in values],
     }
+
+
+def _empty_source_summary() -> Dict[str, Any]:
+    return {"languages": [], "language_counts": {}, "samples": []}
+
+
+def _component_language_summary(components: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    languages = sorted(
+        {
+            language.get("name")
+            for component in components
+            for language in component.get("languages", [])
+            if language.get("name")
+        }
+    )
+    return {"languages": languages, "language_counts": {name: 0 for name in languages}, "samples": []}
 
 
 class _GitIgnore:
@@ -1346,6 +1572,12 @@ def _walk_files(root: Path, repo_root: Optional[Path] = None, ignore: Optional[_
     if not root.exists():
         return []
     repo = (repo_root or root).resolve()
+    git_files = _git_visible_files(repo, root.resolve())
+    if git_files is not None:
+        for path in git_files:
+            yield path
+        return
+
     matcher = ignore or _GitIgnore(repo)
     for current, dirs, files in os.walk(root):
         current_path = Path(current)
@@ -1363,6 +1595,37 @@ def _walk_files(root: Path, repo_root: Optional[Path] = None, ignore: Optional[_
             if matcher.ignored(rel, is_dir=False):
                 continue
             yield path
+
+
+def _git_visible_files(repo_root: Path, root: Path) -> Optional[List[Path]]:
+    try:
+        subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--is-inside-work-tree"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+    args = ["git", "-C", str(repo_root), "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--"]
+    rel = _rel_to_root(repo_root, root)
+    if rel != ".":
+        args.append(rel)
+    try:
+        result = subprocess.run(args, check=True, capture_output=True)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+    files = []
+    for raw in result.stdout.split(b"\0"):
+        if not raw:
+            continue
+        rel_path = raw.decode("utf-8", errors="replace")
+        path = repo_root / rel_path
+        if path.is_file():
+            files.append(path)
+    return files
 
 
 def _is_profile_file(rel_path: str) -> bool:
@@ -1855,7 +2118,21 @@ def _emit_progress(progress: Optional[Callable[[str], None]], message: str) -> N
 
 
 def _stderr_progress(message: str) -> None:
-    print(message, file=sys.stderr)
+    labels = {
+        "sync: start": (0, "start"),
+        "sync: check cache": (20, "cache"),
+        "sync: reused cached profile": (80, "reuse"),
+        "sync: paths-only": (55, "paths"),
+        "sync: scan repo": (45, "scan"),
+        "sync: wrote cache": (90, "write"),
+        "sync: done": (100, "done"),
+    }
+    percent, label = labels.get(message, (50, message.replace("sync: ", "")))
+    width = 20
+    filled = int(width * percent / 100)
+    bar = "#" * filled + "-" * (width - filled)
+    end = "\n" if percent >= 100 else "\r"
+    print(f"cwp [{bar}] {percent:3d}% {label}", file=sys.stderr, end=end, flush=True)
 
 
 def _format_result(data: Dict[str, Any], output_format: str, verbose: bool = False) -> Dict[str, Any] | str:
@@ -1876,6 +2153,8 @@ def _render_text(data: Dict[str, Any], verbose: bool = False) -> str:
     operation = data.get("operation", "sync")
     if operation == "install-skill":
         return _render_install_skill_text(data, verbose=verbose)
+    if operation == "status" and not verbose:
+        return _render_status_text(data)
 
     profile = data.get("profile") if isinstance(data.get("profile"), dict) else data if isinstance(data.get("project"), dict) else None
     alignment = data.get("alignment") or (profile or {}).get("alignment", {})
@@ -1924,6 +2203,45 @@ def _render_install_skill_text(data: Dict[str, Any], verbose: bool = False) -> s
     if verbose and data.get("content"):
         lines.append("content:")
         lines.append(str(data["content"]).rstrip())
+    if data.get("warnings"):
+        _append_list(lines, "warnings", data.get("warnings", []))
+    return "\n".join(lines)
+
+
+def _render_status_text(data: Dict[str, Any]) -> str:
+    profile = data.get("profile") if isinstance(data.get("profile"), dict) else None
+    alignment = data.get("alignment", {})
+    lines = [
+        "code-workflow-probe",
+        f"status: aligned={_bool_text(alignment.get('aligned'))} reason={alignment.get('reason', 'unknown')}",
+    ]
+    stale = alignment.get("stale_files", [])
+    new_files = alignment.get("new_profile_files", [])
+    removed = alignment.get("removed_profile_files", [])
+    if stale:
+        lines.append(f"stale({len(stale)}): {_preview_names(stale)}")
+    if new_files:
+        lines.append(f"new_profile({len(new_files)}): {_preview_names(new_files)}")
+    if removed:
+        lines.append(f"removed({len(removed)}): {_preview_names(removed)}")
+    if profile:
+        project = profile.get("project", {})
+        components = project.get("components", [])
+        workflows = [workflow for component in components for workflow in component.get("workflows", [])]
+        safe = sum(1 for workflow in workflows if workflow.get("safe_auto"))
+        review = len(workflows) - safe
+        lines.append(
+            f"profile: type={project.get('type', 'unknown')} "
+            f"components={len(components)} tech={_format_fact_names(project.get('technologies', []))} "
+            f"pm={_format_package_managers(project.get('package_managers', []))}"
+        )
+        lines.append(
+            f"workflows: safe_auto={safe} needs_review={review} ci={len(project.get('ci_workflows', []))}"
+        )
+        evidence_files = sorted(profile.get("evidence_files", {}))
+        lines.append(f"evidence({len(evidence_files)}): {_preview_names(evidence_files)}")
+    else:
+        lines.append("profile: unavailable")
     if data.get("warnings"):
         _append_list(lines, "warnings", data.get("warnings", []))
     return "\n".join(lines)
@@ -2065,6 +2383,15 @@ def _format_names(values: Sequence[str]) -> str:
     return ",".join(values) if values else "none"
 
 
+def _preview_names(values: Sequence[str], limit: int = 5) -> str:
+    if not values:
+        return "none"
+    preview = ", ".join(values[:limit])
+    if len(values) > limit:
+        preview += f", +{len(values) - limit} more"
+    return preview
+
+
 def _append_list(lines: List[str], label: str, values: Sequence[str]) -> None:
     lines.append(f"{label}:")
     if not values:
@@ -2108,9 +2435,15 @@ Use `code-workflow-probe` when working in a repository and you need current, evi
    `code-workflow-probe edit --root <repo> --changed <path> [<path>...]`
 5. To update via incremental sync after known edits, pass the changed files:
    `code-workflow-probe sync --root <repo> --changed <path> [<path>...]`
-6. Before validation, map changes to components and workflows:
+6. For very large repos, if you know the changed file list is complete and a cache already exists, use path-only sync:
+   `code-workflow-probe sync --root <repo> --changed <path> [<path>...] --paths-only`
+7. Use progress for long syncs:
+   `code-workflow-probe sync --root <repo> --changed <path> [<path>...] --progress`
+8. If changed files are unknown or incomplete, force a complete scan:
+   `code-workflow-probe sync --root <repo> --full`
+9. Before validation, map changes to components and workflows:
    `code-workflow-probe affected --root <repo> --changed <path> [<path>...]`
-7. If status says the profile is not aligned, run sync before trusting workflow conclusions:
+10. If status says the profile is not aligned, run sync before trusting workflow conclusions:
    `code-workflow-probe status --root <repo>`
 
 ## Important Sync Rule
@@ -2118,6 +2451,8 @@ Use `code-workflow-probe` when working in a repository and you need current, evi
 Strongly prefer running `code-workflow-probe sync --root <repo> --changed <path> [<path>...]` after editing project or workflow management files, including manifests, lockfiles, package-manager files, task-runner files, CI files, test/lint/format/build config, and monorepo/component boundary files.
 
 Examples include `package.json`, lockfiles, `pyproject.toml`, `requirements*.txt`, `go.mod`, `Cargo.toml`, `pom.xml`, Gradle files, `Makefile`, `justfile`, `.github/workflows/*`, `.gitlab-ci.yml`, `pytest.ini`, `ruff.toml`, ESLint config, Prettier config, and similar workflow evidence files.
+
+Use `--paths-only` only when the changed path list is complete. If you are unsure whether files were added, removed, renamed, generated, or edited outside your view, do not use `--paths-only`; run normal sync or `--full`.
 
 ## Safety Rules
 
@@ -2152,6 +2487,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sync_parser.add_argument("--changed", nargs="*", default=[], help="Changed files to include in output context.")
     sync_parser.add_argument("--no-write", action="store_true", help="Do not write cache.")
     sync_parser.add_argument("--full", action="store_true", help="Force a full repo scan instead of incremental cache reuse.")
+    sync_parser.add_argument("--paths-only", action="store_true", help="Sync only from explicit changed paths plus existing cache; never discover the whole repo.")
 
     status_parser = subparsers.add_parser("status", help="Check whether cached profile is aligned.")
     add_common(status_parser)
@@ -2188,6 +2524,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             format=args.format,
             verbose=args.verbose,
             incremental=not args.full,
+            paths_only=args.paths_only,
             progress=progress,
         )
     elif args.command == "status":
