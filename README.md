@@ -43,6 +43,16 @@ code-workflow-probe sync --root . --changed pyproject.toml --paths-only
 
 Use `--progress` to print sync progress to stderr, and `--full` to force a full scan.
 
+## Status Output
+
+`status` is intentionally compact by default for large repos. It shows only alignment, stale/new/removed evidence previews, profile counts, workflow counts, and a short evidence preview.
+
+Use `--verbose` only when you need the full component/workflow/evidence listing:
+
+```bash
+code-workflow-probe status --root . --verbose
+```
+
 ## Python API
 
 ```python
