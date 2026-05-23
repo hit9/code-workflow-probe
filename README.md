@@ -12,6 +12,14 @@ It does not use an LLM and does not guess missing workflows.
 uv tool install code-workflow-probe
 ```
 
+## Evidence Model
+
+Detectors parse structured files such as `pyproject.toml`, `package.json`, lockfiles, task runners, and CI config. For example, Python pytest workflow detection treats `pytest.ini`, `setup.cfg` pytest sections, or `[tool.pytest...]` in `pyproject.toml` as high-confidence test config evidence.
+
+Dependencies such as `pytest` or `ruff` can identify the tech stack, but they do not by themselves create a high-confidence workflow command. If only test files are found without pytest config, the pytest command is marked as a lower-confidence candidate.
+
+Current deterministic detector families include JavaScript/TypeScript, Deno, Python, Go, Rust, Java/JVM, Ruby/Bundler, PHP/Composer, .NET, and SwiftPM.
+
 ## Quick Use
 
 ```bash
@@ -26,6 +34,16 @@ Default output is concise text for LLM context. Use JSON for structured consumer
 ```bash
 code-workflow-probe sync --root . --format json
 ```
+
+## Text Format
+
+The default text format is optimized as bounded context for AI coding tools:
+
+- It starts with alignment so stale profiles are not silently trusted.
+- It names project type, tech stack, package manager, component path, and workflow `cwd`.
+- It includes concrete local workflow commands for install, test, lint, format, build, and dev when evidence supports them.
+- It marks non-obvious execution safety with `candidate`, `risk=...`, `conf=...`, and `ci-only` notes.
+- It keeps evidence as a short file preview by default; use `--verbose` for fingerprints and full evidence.
 
 Use `--verbose` when you need full evidence and fingerprints.
 
@@ -45,13 +63,35 @@ Use `--progress` to print sync progress to stderr, and `--full` to force a full 
 
 ## Status Output
 
-`status` is intentionally compact by default for large repos. It shows only alignment, stale/new/removed evidence previews, profile counts, workflow counts, and a short evidence preview.
-
-Use `--verbose` only when you need the full component/workflow/evidence listing:
+`status` has three text detail levels:
 
 ```bash
-code-workflow-probe status --root . --verbose
+code-workflow-probe status --root .                    # compact: tech, package managers, workflow commands
+code-workflow-probe status --root . --detail standard  # component structure plus workflow commands
+code-workflow-probe status --root . --detail full      # full component/workflow/evidence listing
 ```
+
+Use `--depth N` and `--limit N` to control the structural preview in `standard`:
+
+```bash
+code-workflow-probe status --root . --detail standard --depth 2 --limit 20
+```
+
+The compact and standard text outputs are designed for AI coding context:
+
+- They include the aligned state, project type, detected tech stack, package managers, and local workflow commands.
+- Workflow preview order is `test`, `lint`, `format`, `build`, `install`, then `dev`.
+- Workflow lines include `cwd` and `command`, plus candidate/risk/confidence notes when relevant.
+- CI-only workflows are counted but not mixed into local command recommendations.
+
+In `standard`, components are shown as a bounded repo structure preview:
+
+- Components are sorted by path ascending.
+- `depth` limits how deep component paths can be.
+- `limit` caps displayed workflow, component, stale, and evidence previews.
+- Hidden counts are reported separately.
+
+`--verbose` is kept as an alias for full status text.
 
 ## Python API
 
@@ -74,10 +114,10 @@ sync_async(root=".", cache_path=None, changed_files=None, write=True, format="te
 Run `sync` in a background thread and return a `concurrent.futures.Future`. If `executor` is omitted, a one-shot thread pool is created and shut down after completion.
 
 ```python
-status(root=".", cache_path=None, format="text", verbose=False)
+status(root=".", cache_path=None, format="text", verbose=False, detail="compact", limit=8, depth=2)
 ```
 
-Check whether the cached profile still matches current evidence files.
+Check whether the cached profile still matches current evidence files. Text `detail` can be `compact`, `standard`, or `full`; JSON returns the structured data.
 
 ```python
 edit(root=".", changed_files=None, cache_path=None, format="text", verbose=False)

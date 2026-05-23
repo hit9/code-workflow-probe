@@ -70,12 +70,60 @@ def workflows(component_data, kind):
     return [item for item in component_data["workflows"] if item["kind"] == kind]
 
 
+def test_status_standard_component_preview_uses_path_depth_and_limit():
+    components = [
+        {
+            "id": "api",
+            "path": "services/api",
+            "workflows": [{"kind": "test", "command": "python -m pytest", "cwd": "services/api", "source": "local", "safe_auto": True}],
+            "evidence": ["services/api/pyproject.toml"],
+            "languages": [{"name": "python"}],
+            "package_manager": {"name": "pip"},
+        },
+        {
+            "id": "web",
+            "path": "apps/web",
+            "workflows": [
+                {"kind": "test", "safe_auto": True},
+                {"kind": "build", "command": "pnpm build", "cwd": "apps/web", "source": "local", "safe_auto": False},
+                {"kind": "test", "command": "pnpm test", "cwd": "apps/web", "source": "local", "safe_auto": True},
+            ],
+            "evidence": ["apps/web/package.json"],
+            "languages": [{"name": "typescript"}],
+            "package_manager": {"name": "pnpm"},
+        },
+        {
+            "id": "worker",
+            "path": "services/deep/worker",
+            "workflows": [{"kind": "test", "command": "python -m pytest", "cwd": "services/deep/worker", "source": "local", "safe_auto": True}],
+            "evidence": ["services/deep/worker/pyproject.toml"],
+            "languages": [{"name": "python"}],
+            "package_manager": {"name": "pip"},
+        },
+    ]
+    lines = []
+
+    probe._append_status_components(lines, components, limit=1, depth=2)
+    text = "\n".join(lines)
+
+    assert "components(depth=2, shown=1/3):" in text
+    assert "id=web" in text
+    assert "id=api" not in text
+    assert "id=worker" not in text
+    assert "workflows(local, shown=1/2):" in text
+    assert "test: cwd=apps/web command=pnpm test" in text
+    assert "build: cwd=apps/web command=pnpm build" not in text
+    assert "hidden: depth=1 limit=1" in text
+
+
 def test_api_default_format_is_text_and_json_format_returns_dict(tmp_path):
     cache = make_mixed_repo(tmp_path)
 
     text = probe.sync(tmp_path, cache)
     data = probe.sync(tmp_path, cache, format="json")
     status_text = probe.status(tmp_path, cache)
+    standard_status = probe.status(tmp_path, cache, detail="standard", limit=1, depth=1)
+    full_status = probe.status(tmp_path, cache, detail="full")
     verbose_status = probe.status(tmp_path, cache, verbose=True)
     verbose_text = probe.sync(tmp_path, cache, verbose=True)
 
@@ -91,7 +139,17 @@ def test_api_default_format_is_text_and_json_format_returns_dict(tmp_path):
     assert "status: aligned=true" in status_text
     assert "profile: type=multi-component components=2" in status_text
     assert "workflows: safe_auto=" in status_text
+    assert "workflows(local, shown=" in status_text
+    assert "component=app test: cwd=app command=pnpm run test" in status_text
+    assert "component=app lint: cwd=app command=pnpm run lint" in status_text
     assert "id=app" not in status_text
+    assert "components(depth=1, shown=1/2):" in standard_status
+    assert "id=app" in standard_status
+    assert "test: cwd=app command=pnpm run test" in standard_status
+    assert "id=service" not in standard_status
+    assert "evidence_files:" not in standard_status
+    assert "id=app" in full_status
+    assert "evidence_files:" in full_status
     assert "id=app" in verbose_status
     assert "evidence_files:" in verbose_text
     assert "sha256=" in verbose_text
@@ -126,6 +184,94 @@ def test_sync_builds_aligned_multi_component_profile(tmp_path):
     assert profile["project"]["ci_workflows"]
     assert all(item["ci_only"] for item in profile["project"]["ci_workflows"])
     assert all(not item["safe_auto"] for item in profile["project"]["ci_workflows"])
+
+
+def test_sync_detects_additional_stack_families(tmp_path):
+    write(
+        tmp_path / "ruby" / "Gemfile",
+        "\n".join([
+            'source "https://rubygems.org"',
+            'gem "rails"',
+            'gem "rspec"',
+            'gem "rubocop"',
+        ]),
+    )
+    write(tmp_path / "ruby" / "Gemfile.lock", "GEM\n")
+    write(
+        tmp_path / "php" / "composer.json",
+        json.dumps(
+            {
+                "require": {"laravel/framework": "^11.0"},
+                "require-dev": {"phpunit/phpunit": "^11.0", "phpstan/phpstan": "^1.0", "laravel/pint": "^1.0"},
+                "scripts": {"test": "phpunit", "lint": "phpstan analyse", "format": "pint"},
+            }
+        ),
+    )
+    write(tmp_path / "php" / "composer.lock", "{}\n")
+    write(tmp_path / "php" / "phpunit.xml", "<phpunit />\n")
+    write(tmp_path / "php" / "phpstan.neon", "parameters: {}\n")
+    write(
+        tmp_path / "deno" / "deno.json",
+        json.dumps({"tasks": {"test": "deno test", "lint": "deno lint", "fmt": "deno fmt", "build": "deno compile main.ts"}}),
+    )
+    write(tmp_path / "deno" / "main.ts", "console.log('ok')\n")
+    write(tmp_path / "dotnet" / "App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>\n")
+    write(tmp_path / "swift" / "Package.swift", "// swift-tools-version: 5.9\n")
+    write(tmp_path / "swift" / "Package.resolved", "{}\n")
+
+    profile = probe.sync(tmp_path, tmp_path / "cache.json", format="json")
+
+    assert {item["id"] for item in profile["project"]["components"]} == {"deno", "dotnet", "php", "ruby", "swift"}
+
+    ruby = component(profile, "ruby")
+    assert ruby["package_manager"]["name"] == "bundler"
+    assert ruby["languages"][0]["name"] == "ruby"
+    assert {workflow["command"] for workflow in ruby["workflows"]} >= {
+        "bundle install",
+        "bundle exec rspec",
+        "bundle exec rubocop",
+    }
+
+    php = component(profile, "php")
+    assert php["package_manager"]["name"] == "composer"
+    assert php["languages"][0]["name"] == "php"
+    assert {workflow["command"] for workflow in php["workflows"]} >= {
+        "composer install",
+        "composer test",
+        "composer lint",
+        "composer format",
+        "vendor/bin/phpunit",
+        "vendor/bin/phpstan analyse",
+    }
+
+    deno = component(profile, "deno")
+    assert deno["package_manager"]["name"] == "deno"
+    assert {item["name"] for item in deno["frameworks"]} == {"deno"}
+    assert {workflow["command"] for workflow in deno["workflows"]} >= {
+        "deno task test",
+        "deno task lint",
+        "deno task fmt",
+        "deno task build",
+    }
+
+    dotnet = component(profile, "dotnet")
+    assert dotnet["package_manager"]["name"] == "dotnet"
+    assert dotnet["languages"][0]["name"] == "csharp"
+    assert {workflow["command"] for workflow in dotnet["workflows"]} >= {
+        "dotnet restore",
+        "dotnet test",
+        "dotnet build",
+        "dotnet format",
+    }
+
+    swift = component(profile, "swift")
+    assert swift["package_manager"]["name"] == "swift package manager"
+    assert swift["languages"][0]["name"] == "swift"
+    assert {workflow["command"] for workflow in swift["workflows"]} >= {
+        "swift package resolve",
+        "swift test",
+        "swift build",
+    }
 
 
 def test_status_and_edit_hook_resync_only_profile_affecting_changes(tmp_path):
@@ -318,11 +464,14 @@ def test_affected_maps_files_to_components_and_local_workflows(tmp_path):
     probe.sync(tmp_path, cache, format="json")
 
     result = probe.affected(tmp_path, ["app/src/main.ts", "service/new_module.py"], cache, format="json")
+    text = probe.affected(tmp_path, ["app/src/main.ts"], cache)
 
     assert result["alignment"]["aligned"] is True
     assert result["affected"]["components"] == ["app", "service"]
     assert {item["component_id"] for item in result["suggested_workflows"]} == {"app", "service"}
     assert {item["kind"] for item in result["suggested_workflows"]} == {"test", "lint", "build"}
+    assert "suggested_workflows:" in text
+    assert "profile: unavailable" not in text
 
 
 def test_cli_supports_global_and_subcommand_options(tmp_path):
@@ -353,6 +502,16 @@ def test_cli_supports_global_and_subcommand_options(tmp_path):
         text=True,
     )
     assert json.loads(status_result.stdout)["alignment"]["aligned"] is True
+
+    status_detail = subprocess.run(
+        [sys.executable, str(script), "status", "--root", str(tmp_path), "--cache", str(cache), "--detail", "standard", "--limit", "1", "--depth", "1"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "components(depth=1, shown=1/2):" in status_detail.stdout
+    assert "id=app" in status_detail.stdout
+    assert "id=service" not in status_detail.stdout
 
 
 def test_install_skill_api_and_cli(tmp_path):

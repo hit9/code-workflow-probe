@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2 - 2026-05-23
+
+- Added `status --detail compact|standard|full`, `--depth`, and `--limit` for bounded AI-focused status output with workflow command previews.
+- Added deterministic detectors for Deno, Ruby/Bundler, PHP/Composer, .NET, and SwiftPM.
+
 ## 0.1.1 - 2026-05-23
 
 - Added `sync_async(...)` Python API for background-thread sync.

@@ -4,7 +4,7 @@
 API:
     sync(root=".", cache_path=None, changed_files=None, write=True, format="text", verbose=False, incremental=True, paths_only=False, progress=None)
     sync_async(root=".", cache_path=None, changed_files=None, write=True, format="text", verbose=False, incremental=True, paths_only=False, progress=None, executor=None)
-    status(root=".", cache_path=None, format="text", verbose=False)
+    status(root=".", cache_path=None, format="text", verbose=False, detail="compact", limit=8, depth=2)
     edit(root=".", changed_files=None, cache_path=None, format="text", verbose=False)
     affected(root=".", changed_files=None, cache_path=None, format="text", verbose=False)
     install_skill(tool="codex", skills_dir=None, dry_run=False, overwrite=True, format="text", verbose=False)
@@ -40,12 +40,16 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback.
     tomllib = None  # type: ignore[assignment]
 
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 SCHEMA_VERSION = 1
 DEFAULT_CACHE_NAME = ".code-workflow-probe.json"
 SKILL_NAME = "code-workflow-probe"
+DEFAULT_STATUS_LIMIT = 8
+DEFAULT_STATUS_DEPTH = 2
+STATUS_DETAILS = {"compact", "standard", "full"}
 
 WORKFLOW_KINDS = ("install", "test", "lint", "format", "build", "dev")
+STATUS_WORKFLOW_KIND_ORDER = ("test", "lint", "format", "build", "install", "dev")
 
 IGNORED_DIRS = {
     ".git",
@@ -89,7 +93,11 @@ COMPONENT_MANIFESTS = {
     "composer.json",
     "deno.json",
     "deno.jsonc",
+    "Package.swift",
 }
+
+DOTNET_PROJECT_EXTENSIONS = {".csproj", ".fsproj", ".vbproj"}
+DOTNET_SOLUTION_EXTENSIONS = {".sln", ".slnx"}
 
 PROFILE_FILE_NAMES = COMPONENT_MANIFESTS | {
     ".gitignore",
@@ -105,6 +113,28 @@ PROFILE_FILE_NAMES = COMPONENT_MANIFESTS | {
     "Pipfile.lock",
     "go.sum",
     "Cargo.lock",
+    "Gemfile.lock",
+    ".ruby-version",
+    "Rakefile",
+    ".rubocop.yml",
+    ".rubocop_todo.yml",
+    "composer.lock",
+    "phpunit.xml",
+    "phpunit.xml.dist",
+    "phpstan.neon",
+    "phpstan.neon.dist",
+    "phpcs.xml",
+    "phpcs.xml.dist",
+    ".php-cs-fixer.php",
+    ".php-cs-fixer.dist.php",
+    "pint.json",
+    "Package.resolved",
+    ".swiftformat",
+    ".swiftlint.yml",
+    "global.json",
+    "NuGet.config",
+    "Directory.Build.props",
+    "Directory.Build.targets",
     "gradlew",
     "gradlew.bat",
     "Makefile",
@@ -182,6 +212,7 @@ SOURCE_EXTENSIONS = {
     ".php": "php",
     ".cs": "csharp",
     ".fs": "fsharp",
+    ".vb": "visualbasic",
     ".swift": "swift",
     ".scala": "scala",
     ".clj": "clojure",
@@ -304,6 +335,9 @@ def status(
     cache_path: str | os.PathLike[str] | None = None,
     format: str = "text",
     verbose: bool = False,
+    detail: str = "compact",
+    limit: int = DEFAULT_STATUS_LIMIT,
+    depth: int = DEFAULT_STATUS_DEPTH,
 ) -> Dict[str, Any] | str:
     """Return whether the cached profile is aligned with current repo files."""
 
@@ -311,6 +345,9 @@ def status(
     cache = _resolve_cache_path(root_path, cache_path)
     cached = _load_json(cache)
     checked_at = _utc_now()
+    status_detail = _normalize_status_detail(detail, verbose)
+    status_limit = _normalize_limit(limit)
+    status_depth = _normalize_depth(depth)
 
     if cached is None:
         return _format_result({
@@ -329,7 +366,7 @@ def status(
             },
             "profile": None,
             "warnings": ["Run sync before using workflow conclusions."],
-        }, format, verbose=verbose)
+        }, format, verbose=verbose, status_detail=status_detail, limit=status_limit, depth=status_depth)
 
     stale = _compare_watch_state(root_path, cache, cached.get("watch", {}))
     aligned = not stale["stale_files"] and not stale["new_profile_files"] and not stale["removed_profile_files"] and not stale["source_summary_changed"]
@@ -355,7 +392,7 @@ def status(
         "alignment": cached["alignment"],
         "profile": cached if aligned else None,
         "warnings": warnings,
-    }, format, verbose=verbose)
+    }, format, verbose=verbose, status_detail=status_detail, limit=status_limit, depth=status_depth)
 
 
 def edit(
@@ -619,8 +656,7 @@ class _ProfileBuilder:
     def _component_roots(self, profile_files: Sequence[str], source_summary: Dict[str, Any]) -> List[str]:
         roots: Set[str] = set()
         for rel in profile_files:
-            name = Path(rel).name
-            if name in COMPONENT_MANIFESTS:
+            if _is_component_manifest(rel):
                 roots.add(_dirname_rel(rel))
 
         if not roots and source_summary["languages"]:
@@ -678,6 +714,41 @@ class _ProfileBuilder:
             languages.extend(java["languages"])
             package_manager = package_manager or java["package_manager"]
             workflows.extend(java["workflows"])
+
+        if self._has_file(path, "Gemfile"):
+            ruby = self._ruby_component(path, scope)
+            languages.extend(ruby["languages"])
+            frameworks.extend(ruby["frameworks"])
+            package_manager = package_manager or ruby["package_manager"]
+            workflows.extend(ruby["workflows"])
+
+        if self._has_file(path, "composer.json"):
+            php = self._php_component(path, scope)
+            languages.extend(php["languages"])
+            frameworks.extend(php["frameworks"])
+            package_manager = package_manager or php["package_manager"]
+            workflows.extend(php["workflows"])
+
+        if self._has_any(path, {"deno.json", "deno.jsonc"}):
+            deno = self._deno_component(path, scope, all_roots)
+            languages.extend(deno["languages"])
+            frameworks.extend(deno["frameworks"])
+            package_manager = package_manager or deno["package_manager"]
+            workflows.extend(deno["workflows"])
+
+        if self._has_file(path, "Package.swift"):
+            swift = self._swift_component(path, scope)
+            languages.extend(swift["languages"])
+            package_manager = package_manager or swift["package_manager"]
+            workflows.extend(swift["workflows"])
+
+        dotnet_manifests = self._dotnet_manifest_files(path)
+        if dotnet_manifests:
+            dotnet = self._dotnet_component(path, scope, dotnet_manifests)
+            languages.extend(dotnet["languages"])
+            frameworks.extend(dotnet["frameworks"])
+            package_manager = package_manager or dotnet["package_manager"]
+            workflows.extend(dotnet["workflows"])
 
         if not languages and self.allow_source_scan:
             fallback = self._source_fallback_component(path, all_roots)
@@ -1027,6 +1098,239 @@ class _ProfileBuilder:
             "package_manager": pm,
             "workflows": workflows,
         }
+
+    def _ruby_component(self, path: str, scope: str) -> Dict[str, Any]:
+        evidence = [self.evidence.add(_join_rel(path, "Gemfile"), "ruby_manifest")]
+        if self._has_file(path, "Gemfile.lock"):
+            evidence.append(self.evidence.add(_join_rel(path, "Gemfile.lock"), "ruby_lockfile"))
+        gems = _ruby_gem_names(self.root / path / "Gemfile")
+        frameworks = [_fact(name, 0.8, evidence, "Gemfile dependency") for name in _ruby_frameworks(gems)]
+        pm = _package_manager("bundler", "bundle", 0.95 if self._has_file(path, "Gemfile.lock") else 0.9, evidence)
+        workflows = [self._workflow("install", "bundle install", path, scope, evidence, pm["confidence"], "local", True)]
+
+        if {"rspec", "rspec-rails"} & gems:
+            workflows.append(self._workflow("test", "bundle exec rspec", path, scope, evidence, "high", "local", True))
+
+        rubocop_evidence = list(evidence) if "rubocop" in gems else []
+        for name in (".rubocop.yml", ".rubocop_todo.yml"):
+            if self._has_file(path, name):
+                rubocop_evidence.append(self.evidence.add(_join_rel(path, name), "lint_config"))
+        if rubocop_evidence:
+            workflows.append(self._workflow("lint", "bundle exec rubocop", path, scope, rubocop_evidence, "high", "local", True))
+            workflows.append(
+                self._workflow(
+                    "format",
+                    "bundle exec rubocop -A",
+                    path,
+                    scope,
+                    rubocop_evidence,
+                    "medium",
+                    "local",
+                    recommended=False,
+                    reason="rubocop autocorrect changes files and should be reviewed before running",
+                )
+            )
+
+        return {
+            "languages": [_fact("ruby", 0.95, evidence, "Gemfile")],
+            "frameworks": frameworks,
+            "package_manager": pm,
+            "workflows": workflows,
+        }
+
+    def _php_component(self, path: str, scope: str) -> Dict[str, Any]:
+        rel_composer = _join_rel(path, "composer.json")
+        composer = _load_json(self.root / rel_composer) or {}
+        evidence = [self.evidence.add(rel_composer, "php_manifest")]
+        if self._has_file(path, "composer.lock"):
+            evidence.append(self.evidence.add(_join_rel(path, "composer.lock"), "php_lockfile"))
+        dependencies = _composer_dependencies(composer)
+        frameworks = [_fact(name, 0.8, evidence, "composer dependency") for name in _php_frameworks(dependencies)]
+        pm = _package_manager("composer", "composer", 0.95 if self._has_file(path, "composer.lock") else 0.9, evidence)
+        workflows = [self._workflow("install", "composer install", path, scope, evidence, pm["confidence"], "local", True)]
+
+        scripts = composer.get("scripts", {}) if isinstance(composer.get("scripts"), dict) else {}
+        for kind in WORKFLOW_KINDS:
+            if kind not in scripts:
+                continue
+            script_value = scripts.get(kind)
+            script_text = _script_preview(script_value)
+            workflows.append(
+                self._workflow(
+                    kind,
+                    f"composer {kind}",
+                    path,
+                    scope,
+                    evidence,
+                    "high",
+                    "local",
+                    recommended=True,
+                    risk=_risk_for_command(kind, script_text),
+                    reason=f"composer.json script '{kind}'",
+                    command_preview=script_text,
+                )
+            )
+
+        phpunit_evidence = [
+            self.evidence.add(_join_rel(path, name), "test_config")
+            for name in ("phpunit.xml", "phpunit.xml.dist")
+            if self._has_file(path, name)
+        ]
+        if phpunit_evidence:
+            workflows.append(self._workflow("test", "vendor/bin/phpunit", path, scope, phpunit_evidence, "high", "local", True))
+
+        phpstan_evidence = [
+            self.evidence.add(_join_rel(path, name), "lint_config")
+            for name in ("phpstan.neon", "phpstan.neon.dist")
+            if self._has_file(path, name)
+        ]
+        if phpstan_evidence:
+            workflows.append(self._workflow("lint", "vendor/bin/phpstan analyse", path, scope, phpstan_evidence, "high", "local", True))
+
+        phpcs_evidence = [
+            self.evidence.add(_join_rel(path, name), "lint_config")
+            for name in ("phpcs.xml", "phpcs.xml.dist")
+            if self._has_file(path, name)
+        ]
+        if phpcs_evidence:
+            workflows.append(self._workflow("lint", "vendor/bin/phpcs", path, scope, phpcs_evidence, "high", "local", True))
+
+        pint_evidence = []
+        if "laravel/pint" in dependencies:
+            pint_evidence.extend(evidence)
+        if self._has_file(path, "pint.json"):
+            pint_evidence.append(self.evidence.add(_join_rel(path, "pint.json"), "format_config"))
+        if pint_evidence:
+            workflows.append(self._workflow("format", "vendor/bin/pint", path, scope, pint_evidence, "medium", "local", False))
+
+        fixer_evidence = [
+            self.evidence.add(_join_rel(path, name), "format_config")
+            for name in (".php-cs-fixer.php", ".php-cs-fixer.dist.php")
+            if self._has_file(path, name)
+        ]
+        if fixer_evidence:
+            workflows.append(self._workflow("format", "vendor/bin/php-cs-fixer fix", path, scope, fixer_evidence, "medium", "local", False))
+
+        return {
+            "languages": [_fact("php", 0.95, evidence, "composer.json")],
+            "frameworks": frameworks,
+            "package_manager": pm,
+            "workflows": workflows,
+        }
+
+    def _deno_component(self, path: str, scope: str, all_roots: Sequence[str]) -> Dict[str, Any]:
+        manifest_name = "deno.json" if self._has_file(path, "deno.json") else "deno.jsonc"
+        rel_manifest = _join_rel(path, manifest_name)
+        manifest = _load_json_or_jsonc(self.root / rel_manifest) or {}
+        evidence = [self.evidence.add(rel_manifest, "deno_manifest")]
+        languages = self._source_language_facts(path, all_roots, {".ts", ".tsx", ".js", ".jsx"})
+        frameworks = [_fact("deno", 0.95, evidence, "deno manifest")]
+        pm = _package_manager("deno", "deno", 0.95, evidence)
+        workflows: List[Dict[str, Any]] = []
+        tasks = manifest.get("tasks", {}) if isinstance(manifest.get("tasks"), dict) else {}
+        task_names = {"format": ("format", "fmt")}
+        for kind in WORKFLOW_KINDS:
+            names = task_names.get(kind, (kind,))
+            task_name = next((name for name in names if name in tasks), None)
+            if not task_name:
+                continue
+            task_text = _script_preview(tasks.get(task_name))
+            workflows.append(
+                self._workflow(
+                    kind,
+                    f"deno task {task_name}",
+                    path,
+                    scope,
+                    evidence,
+                    "high",
+                    "local",
+                    recommended=True,
+                    risk=_risk_for_command(kind, task_text),
+                    reason=f"{manifest_name} task '{task_name}'",
+                    command_preview=task_text,
+                )
+            )
+        return {
+            "languages": languages,
+            "frameworks": frameworks,
+            "package_manager": pm,
+            "workflows": workflows,
+        }
+
+    def _swift_component(self, path: str, scope: str) -> Dict[str, Any]:
+        evidence = [self.evidence.add(_join_rel(path, "Package.swift"), "swift_manifest")]
+        if self._has_file(path, "Package.resolved"):
+            evidence.append(self.evidence.add(_join_rel(path, "Package.resolved"), "swift_lockfile"))
+        workflows = [
+            self._workflow("install", "swift package resolve", path, scope, evidence, "high", "local", True),
+            self._workflow("test", "swift test", path, scope, evidence, "high", "local", True),
+            self._workflow("build", "swift build", path, scope, evidence, "medium", "local", False),
+        ]
+        if self._has_file(path, ".swiftlint.yml"):
+            workflows.append(self._workflow("lint", "swiftlint", path, scope, [self.evidence.add(_join_rel(path, ".swiftlint.yml"), "lint_config")], "medium", "local", False))
+        if self._has_file(path, ".swiftformat"):
+            workflows.append(self._workflow("format", "swiftformat .", path, scope, [self.evidence.add(_join_rel(path, ".swiftformat"), "format_config")], "medium", "local", False))
+        return {
+            "languages": [_fact("swift", 0.95, evidence, "Package.swift")],
+            "package_manager": _package_manager("swift package manager", "swift", 0.95, evidence),
+            "workflows": workflows,
+        }
+
+    def _dotnet_component(self, path: str, scope: str, manifests: Sequence[str]) -> Dict[str, Any]:
+        evidence = [self.evidence.add(rel, "dotnet_manifest") for rel in manifests]
+        languages = _dotnet_languages_from_manifests(evidence)
+        frameworks = [_fact("dotnet", 0.95, evidence, ".NET project or solution manifest")]
+        pm = _package_manager("dotnet", "dotnet", 0.95, evidence)
+        workflows = [
+            self._workflow("install", "dotnet restore", path, scope, evidence, "high", "local", True),
+            self._workflow("test", "dotnet test", path, scope, evidence, "high", "local", True),
+            self._workflow("build", "dotnet build", path, scope, evidence, "medium", "local", False),
+            self._workflow("format", "dotnet format", path, scope, evidence, "medium", "local", False),
+        ]
+        return {
+            "languages": languages,
+            "frameworks": frameworks,
+            "package_manager": pm,
+            "workflows": workflows,
+        }
+
+    def _dotnet_manifest_files(self, path: str) -> List[str]:
+        component_dir = self.root if path == "." else self.root / path
+        if not component_dir.is_dir():
+            return []
+        manifests = []
+        for child in component_dir.iterdir():
+            if not child.is_file():
+                continue
+            rel = _rel_to_root(self.root, child)
+            if _is_dotnet_manifest(rel) and _visible_file(self.root, self.ignore, rel):
+                manifests.append(rel)
+        return sorted(manifests)
+
+    def _source_language_facts(
+        self,
+        path: str,
+        all_roots: Sequence[str],
+        extensions: Set[str],
+    ) -> List[Dict[str, Any]]:
+        if not self.allow_source_scan:
+            return []
+        component_dir = self.root if path == "." else self.root / path
+        ignored_roots = [root for root in all_roots if root != "." and root != path and _is_under(root, path)]
+        samples: Dict[str, List[str]] = defaultdict(list)
+        for file_path in _walk_files(component_dir, self.root, self.ignore):
+            rel = _rel_to_root(self.root, file_path)
+            if any(_is_under(rel, ignored) for ignored in ignored_roots):
+                continue
+            if file_path.suffix not in extensions:
+                continue
+            language = SOURCE_EXTENSIONS.get(file_path.suffix)
+            if language and len(samples[language]) < 3:
+                samples[language].append(rel)
+        facts = []
+        for language, paths in sorted(samples.items()):
+            facts.append(_fact(language, 0.85, self.evidence.add_many(paths, "source_language_sample"), "source file extension sample"))
+        return facts
 
     def _source_fallback_component(self, path: str, all_roots: Sequence[str]) -> Dict[str, Any]:
         component_dir = self.root if path == "." else self.root / path
@@ -1631,13 +1935,23 @@ def _git_visible_files(repo_root: Path, root: Path) -> Optional[List[Path]]:
 def _is_profile_file(rel_path: str) -> bool:
     rel = _clean_rel(rel_path)
     name = Path(rel).name
-    if name in PROFILE_FILE_NAMES:
+    if name in PROFILE_FILE_NAMES or _is_dotnet_manifest(rel):
         return True
     if rel.startswith(".github/workflows/") and Path(rel).suffix in {".yml", ".yaml"}:
         return True
     if rel == ".circleci/config.yml":
         return True
     return False
+
+
+def _is_component_manifest(rel_path: str) -> bool:
+    rel = _clean_rel(rel_path)
+    return Path(rel).name in COMPONENT_MANIFESTS or _is_dotnet_manifest(rel)
+
+
+def _is_dotnet_manifest(rel_path: str) -> bool:
+    suffix = Path(_clean_rel(rel_path)).suffix
+    return suffix in DOTNET_PROJECT_EXTENSIONS or suffix in DOTNET_SOLUTION_EXTENSIONS
 
 
 def _is_ci_file(rel_path: str) -> bool:
@@ -1923,6 +2237,64 @@ def _python_install_command(pm: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _ruby_gem_names(path: Path) -> Set[str]:
+    text = _read_text(path)
+    names = set()
+    for match in re.finditer(r"^\s*gem\s+['\"]([^'\"]+)['\"]", text, flags=re.MULTILINE):
+        names.add(match.group(1).lower())
+    return names
+
+
+def _ruby_frameworks(gems: Set[str]) -> List[str]:
+    known = {
+        "rails": "rails",
+        "sinatra": "sinatra",
+        "rspec": "rspec",
+        "rspec-rails": "rspec",
+        "rubocop": "rubocop",
+    }
+    return sorted({label for gem, label in known.items() if gem in gems})
+
+
+def _composer_dependencies(composer: Dict[str, Any]) -> Set[str]:
+    dependencies: Set[str] = set()
+    for key in ("require", "require-dev"):
+        value = composer.get(key)
+        if isinstance(value, dict):
+            dependencies.update(str(name).lower() for name in value)
+    return dependencies
+
+
+def _php_frameworks(dependencies: Set[str]) -> List[str]:
+    known = {
+        "laravel/framework": "laravel",
+        "symfony/framework-bundle": "symfony",
+        "phpunit/phpunit": "phpunit",
+        "phpstan/phpstan": "phpstan",
+        "squizlabs/php_codesniffer": "phpcs",
+        "friendsofphp/php-cs-fixer": "php-cs-fixer",
+        "laravel/pint": "pint",
+    }
+    return sorted({label for dep, label in known.items() if dep in dependencies})
+
+
+def _dotnet_languages_from_manifests(manifests: Sequence[str]) -> List[Dict[str, Any]]:
+    languages = []
+    for suffix, language in ((".csproj", "csharp"), (".fsproj", "fsharp"), (".vbproj", "visualbasic")):
+        evidence = [path for path in manifests if path.endswith(suffix)]
+        if evidence:
+            languages.append(_fact(language, 0.95, evidence, f".NET {suffix} project file"))
+    return languages
+
+
+def _script_preview(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return " && ".join(str(item) for item in value)
+    return str(value or "")
+
+
 def _js_install_command(pm: Dict[str, Any]) -> str:
     name = pm["name"]
     evidence = set(pm.get("evidence", []))
@@ -1984,6 +2356,62 @@ def _load_json(path: Path) -> Optional[Dict[str, Any]]:
         return value if isinstance(value, dict) else None
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _load_json_or_jsonc(path: Path) -> Optional[Dict[str, Any]]:
+    if path.suffix != ".jsonc":
+        return _load_json(path)
+    text = _read_text(path)
+    if not text:
+        return None
+    try:
+        value = json.loads(_strip_trailing_commas(_strip_json_comments(text)))
+        return value if isinstance(value, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _strip_json_comments(text: str) -> str:
+    result = []
+    index = 0
+    in_string = False
+    escape = False
+    while index < len(text):
+        char = text[index]
+        nxt = text[index + 1] if index + 1 < len(text) else ""
+        if in_string:
+            result.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            result.append(char)
+            index += 1
+            continue
+        if char == "/" and nxt == "/":
+            index += 2
+            while index < len(text) and text[index] not in "\r\n":
+                index += 1
+            continue
+        if char == "/" and nxt == "*":
+            index += 2
+            while index + 1 < len(text) and not (text[index] == "*" and text[index + 1] == "/"):
+                index += 1
+            index += 2
+            continue
+        result.append(char)
+        index += 1
+    return "".join(result)
+
+
+def _strip_trailing_commas(text: str) -> str:
+    return re.sub(r",(\s*[}\]])", r"\1", text)
 
 
 def _load_toml(path: Path) -> Dict[str, Any]:
@@ -2135,11 +2563,18 @@ def _stderr_progress(message: str) -> None:
     print(f"cwp [{bar}] {percent:3d}% {label}", file=sys.stderr, end=end, flush=True)
 
 
-def _format_result(data: Dict[str, Any], output_format: str, verbose: bool = False) -> Dict[str, Any] | str:
+def _format_result(
+    data: Dict[str, Any],
+    output_format: str,
+    verbose: bool = False,
+    status_detail: Optional[str] = None,
+    limit: int = DEFAULT_STATUS_LIMIT,
+    depth: int = DEFAULT_STATUS_DEPTH,
+) -> Dict[str, Any] | str:
     fmt = _normalize_output_format(output_format)
     if fmt == "json":
         return data
-    return _render_text(data, verbose=verbose)
+    return _render_text(data, verbose=verbose, status_detail=status_detail, limit=limit, depth=depth)
 
 
 def _normalize_output_format(output_format: str) -> str:
@@ -2149,12 +2584,21 @@ def _normalize_output_format(output_format: str) -> str:
     return fmt
 
 
-def _render_text(data: Dict[str, Any], verbose: bool = False) -> str:
+def _render_text(
+    data: Dict[str, Any],
+    verbose: bool = False,
+    status_detail: Optional[str] = None,
+    limit: int = DEFAULT_STATUS_LIMIT,
+    depth: int = DEFAULT_STATUS_DEPTH,
+) -> str:
     operation = data.get("operation", "sync")
     if operation == "install-skill":
         return _render_install_skill_text(data, verbose=verbose)
-    if operation == "status" and not verbose:
-        return _render_status_text(data)
+    if operation == "status":
+        detail = _normalize_status_detail(status_detail or "compact", verbose)
+        if detail != "full":
+            return _render_status_text(data, detail=detail, limit=limit, depth=depth)
+        verbose = True
 
     profile = data.get("profile") if isinstance(data.get("profile"), dict) else data if isinstance(data.get("project"), dict) else None
     alignment = data.get("alignment") or (profile or {}).get("alignment", {})
@@ -2182,6 +2626,8 @@ def _render_text(data: Dict[str, Any], verbose: bool = False) -> str:
 
     if profile:
         _append_profile_text(lines, profile, verbose=verbose)
+    elif operation in {"affected", "edit"}:
+        pass
     else:
         lines.append("profile: unavailable")
 
@@ -2208,9 +2654,16 @@ def _render_install_skill_text(data: Dict[str, Any], verbose: bool = False) -> s
     return "\n".join(lines)
 
 
-def _render_status_text(data: Dict[str, Any]) -> str:
+def _render_status_text(
+    data: Dict[str, Any],
+    detail: str = "compact",
+    limit: int = DEFAULT_STATUS_LIMIT,
+    depth: int = DEFAULT_STATUS_DEPTH,
+) -> str:
     profile = data.get("profile") if isinstance(data.get("profile"), dict) else None
     alignment = data.get("alignment", {})
+    preview_limit = _normalize_limit(limit)
+    preview_depth = _normalize_depth(depth)
     lines = [
         "code-workflow-probe",
         f"status: aligned={_bool_text(alignment.get('aligned'))} reason={alignment.get('reason', 'unknown')}",
@@ -2219,11 +2672,11 @@ def _render_status_text(data: Dict[str, Any]) -> str:
     new_files = alignment.get("new_profile_files", [])
     removed = alignment.get("removed_profile_files", [])
     if stale:
-        lines.append(f"stale({len(stale)}): {_preview_names(stale)}")
+        lines.append(f"stale({len(stale)}): {_preview_names(stale, preview_limit)}")
     if new_files:
-        lines.append(f"new_profile({len(new_files)}): {_preview_names(new_files)}")
+        lines.append(f"new_profile({len(new_files)}): {_preview_names(new_files, preview_limit)}")
     if removed:
-        lines.append(f"removed({len(removed)}): {_preview_names(removed)}")
+        lines.append(f"removed({len(removed)}): {_preview_names(removed, preview_limit)}")
     if profile:
         project = profile.get("project", {})
         components = project.get("components", [])
@@ -2238,13 +2691,155 @@ def _render_status_text(data: Dict[str, Any]) -> str:
         lines.append(
             f"workflows: safe_auto={safe} needs_review={review} ci={len(project.get('ci_workflows', []))}"
         )
+        if detail == "compact":
+            _append_status_workflows(lines, components, preview_limit, include_component=True)
+        elif detail == "standard":
+            _append_status_components(lines, components, preview_limit, preview_depth)
         evidence_files = sorted(profile.get("evidence_files", {}))
-        lines.append(f"evidence({len(evidence_files)}): {_preview_names(evidence_files)}")
+        lines.append(f"evidence({len(evidence_files)}): {_preview_names(evidence_files, preview_limit)}")
     else:
         lines.append("profile: unavailable")
     if data.get("warnings"):
         _append_list(lines, "warnings", data.get("warnings", []))
     return "\n".join(lines)
+
+
+def _normalize_status_detail(detail: Optional[str], verbose: bool = False) -> str:
+    if verbose:
+        return "full"
+    value = (detail or "compact").lower()
+    if value not in STATUS_DETAILS:
+        raise ValueError("detail must be 'compact', 'standard', or 'full'")
+    return value
+
+
+def _normalize_limit(limit: int) -> int:
+    try:
+        value = int(limit)
+    except (TypeError, ValueError):
+        return DEFAULT_STATUS_LIMIT
+    return max(1, value)
+
+
+def _normalize_depth(depth: int) -> int:
+    try:
+        value = int(depth)
+    except (TypeError, ValueError):
+        return DEFAULT_STATUS_DEPTH
+    return max(0, value)
+
+
+def _append_status_components(lines: List[str], components: Sequence[Dict[str, Any]], limit: int, depth: int) -> None:
+    if not components:
+        return
+    ordered = sorted(components, key=lambda component: str(component.get("path") or ""))
+    visible = [component for component in ordered if _component_within_depth(component, depth)]
+    selected = visible[:limit]
+    lines.append(f"components(depth={depth}, shown={len(selected)}/{len(components)}):")
+    for component in selected:
+        workflows = component.get("workflows", [])
+        safe = _workflow_kind_preview([workflow for workflow in workflows if workflow.get("safe_auto")])
+        review = _workflow_kind_preview([workflow for workflow in workflows if not workflow.get("safe_auto")])
+        lines.append(
+            "- "
+            f"id={component.get('id')} "
+            f"path={component.get('path')} "
+            f"lang={_format_fact_names(component.get('languages', []))} "
+            f"pm={_format_package_manager(component.get('package_manager'))} "
+            f"safe={safe} review={review}"
+        )
+        _append_status_workflows(lines, [component], limit, indent="  ", include_component=False)
+    hidden_by_depth = len(ordered) - len(visible)
+    hidden_by_limit = len(visible) - len(selected)
+    if hidden_by_depth or hidden_by_limit:
+        lines.append(f"- hidden: depth={hidden_by_depth} limit={hidden_by_limit}")
+
+
+def _component_within_depth(component: Dict[str, Any], depth: int) -> bool:
+    path = str(component.get("path") or ".")
+    if path == ".":
+        return True
+    return len([part for part in path.split("/") if part]) <= depth
+
+
+def _workflow_kind_preview(workflows: Sequence[Dict[str, Any]], limit: int = 4) -> str:
+    kinds = sorted({str(workflow.get("kind")) for workflow in workflows if workflow.get("kind")})
+    return _preview_names(kinds, limit)
+
+
+def _append_status_workflows(
+    lines: List[str],
+    components: Sequence[Dict[str, Any]],
+    limit: int,
+    indent: str = "",
+    include_component: bool = True,
+) -> None:
+    items = _status_workflow_items(components)
+    selected = _select_status_workflow_items(items, limit)
+    lines.append(f"{indent}workflows(local, shown={len(selected)}/{len(items)}):")
+    if not items:
+        lines.append(f"{indent}- none")
+        return
+    for item in selected:
+        prefix = f"component={item['component_id']} " if include_component else ""
+        lines.append(f"{indent}- {prefix}{_format_workflow(item['workflow'])}")
+    if len(items) > len(selected):
+        lines.append(f"{indent}- +{len(items) - len(selected)} more")
+
+
+def _status_workflow_items(components: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for component in components:
+        for workflow in component.get("workflows", []):
+            if workflow.get("source") != "local" or workflow.get("ci_only") or not workflow.get("command"):
+                continue
+            items.append({
+                "component_id": component.get("id"),
+                "component_path": component.get("path") or ".",
+                "workflow": workflow,
+            })
+    return sorted(items, key=_status_workflow_sort_key)
+
+
+def _select_status_workflow_items(items: Sequence[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    max_items = _normalize_limit(limit)
+    selected: List[Dict[str, Any]] = []
+    selected_indexes: Set[int] = set()
+
+    for kind in STATUS_WORKFLOW_KIND_ORDER:
+        for index, item in enumerate(items):
+            if index in selected_indexes or item["workflow"].get("kind") != kind:
+                continue
+            selected.append(item)
+            selected_indexes.add(index)
+            break
+        if len(selected) >= max_items:
+            return sorted(selected, key=_status_workflow_sort_key)
+
+    for index, item in enumerate(items):
+        if index in selected_indexes:
+            continue
+        selected.append(item)
+        selected_indexes.add(index)
+        if len(selected) >= max_items:
+            break
+
+    return sorted(selected, key=_status_workflow_sort_key)
+
+
+def _status_workflow_sort_key(item: Dict[str, Any]) -> Tuple[int, str, int, int, str]:
+    workflow = item["workflow"]
+    kind = str(workflow.get("kind") or "")
+    kind_order = {name: index for index, name in enumerate(STATUS_WORKFLOW_KIND_ORDER)}
+    safe_rank = 0 if workflow.get("safe_auto") else 1
+    recommended_rank = 0 if workflow.get("recommended") else 1
+    return (
+        kind_order.get(kind, len(STATUS_WORKFLOW_KIND_ORDER)),
+        str(item.get("component_path") or ""),
+        safe_rank,
+        recommended_rank,
+        str(workflow.get("command") or ""),
+    )
 
 
 def _append_profile_text(lines: List[str], profile: Dict[str, Any], verbose: bool = False) -> None:
@@ -2443,7 +3038,7 @@ Use `code-workflow-probe` when working in a repository and you need current, evi
    `code-workflow-probe sync --root <repo> --full`
 9. Before validation, map changes to components and workflows:
    `code-workflow-probe affected --root <repo> --changed <path> [<path>...]`
-10. If status says the profile is not aligned, run sync before trusting workflow conclusions:
+10. Use status when you need a bounded AI context summary of tech stack, package managers, and workflow commands. If compact status is too sparse, use `--detail standard --depth <n> --limit <n>`:
    `code-workflow-probe status --root <repo>`
 
 ## Important Sync Rule
@@ -2491,6 +3086,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     status_parser = subparsers.add_parser("status", help="Check whether cached profile is aligned.")
     add_common(status_parser)
+    status_parser.add_argument("--detail", choices=("compact", "standard", "full"), default="compact", help="Text detail level for status output.")
+    status_parser.add_argument("--limit", type=int, default=DEFAULT_STATUS_LIMIT, help="Preview limit for compact and standard status output.")
+    status_parser.add_argument("--depth", type=int, default=DEFAULT_STATUS_DEPTH, help="Directory depth for standard status component previews.")
 
     edit_parser = subparsers.add_parser("edit", help="Notify changed files and update profile if needed.")
     add_common(edit_parser)
@@ -2528,7 +3126,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             progress=progress,
         )
     elif args.command == "status":
-        output = status(args.root, args.cache, format=args.format, verbose=args.verbose)
+        output = status(args.root, args.cache, format=args.format, verbose=args.verbose, detail=args.detail, limit=args.limit, depth=args.depth)
     elif args.command == "edit":
         output = edit(args.root, args.changed, args.cache, format=args.format, verbose=args.verbose)
     elif args.command == "affected":
