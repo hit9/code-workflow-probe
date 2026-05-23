@@ -1,8 +1,9 @@
 UV ?= uv
 MODULE := code_workflow_probe
 CACHE ?= .code-workflow-probe.json
+PUBLISH_ARGS ?=
 
-.PHONY: help install sync test check smoke status build clean version
+.PHONY: help install sync test check smoke status build publish clean version
 
 help:
 	@printf '%s\n' \
@@ -14,6 +15,7 @@ help:
 		'  make smoke     Run a small CLI/API smoke test' \
 		'  make status    Show an AI-focused project workflow summary' \
 		'  make build     Build package artifacts' \
+		'  make publish   Check, build, and publish package artifacts with uv' \
 		'  make clean     Remove local test/build/probe artifacts' \
 		'  make version   Print package version'
 
@@ -52,6 +54,11 @@ status:
 
 build:
 	$(UV) build
+
+publish: check
+	rm -rf dist
+	$(UV) build
+	$(UV) publish $(PUBLISH_ARGS)
 
 clean:
 	rm -rf .pytest_cache __pycache__ tests/__pycache__
