@@ -40,7 +40,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback.
     tomllib = None  # type: ignore[assignment]
 
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 SCHEMA_VERSION = 1
 DEFAULT_CACHE_NAME = ".code-workflow-probe.json"
 SKILL_NAME = "code-workflow-probe"
@@ -98,9 +98,7 @@ COMPONENT_MANIFESTS = {
 
 DOTNET_PROJECT_EXTENSIONS = {".csproj", ".fsproj", ".vbproj"}
 DOTNET_SOLUTION_EXTENSIONS = {".sln", ".slnx"}
-
-PROFILE_FILE_NAMES = COMPONENT_MANIFESTS | {
-    ".gitignore",
+ADJACENT_PROFILE_FILE_NAMES = {
     "package-lock.json",
     "npm-shrinkwrap.json",
     "yarn.lock",
@@ -135,6 +133,11 @@ PROFILE_FILE_NAMES = COMPONENT_MANIFESTS | {
     "NuGet.config",
     "Directory.Build.props",
     "Directory.Build.targets",
+}
+
+PROFILE_FILE_NAMES = COMPONENT_MANIFESTS | {
+    ".gitignore",
+    *ADJACENT_PROFILE_FILE_NAMES,
     "gradlew",
     "gradlew.bat",
     "Makefile",
@@ -590,6 +593,7 @@ class _ProfileBuilder:
         self.root = root
         self.cache_path = cache_path
         self.profile_files = list(profile_files) if profile_files is not None else None
+        self.profile_file_set: Set[str] = set(self.profile_files or [])
         self.allow_source_scan = allow_source_scan
         self.ignore = _GitIgnore(root)
         self.evidence = _EvidenceStore(root)
@@ -597,6 +601,8 @@ class _ProfileBuilder:
 
     def build(self, changed_files: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         profile_files = self.profile_files if self.profile_files is not None else _discover_profile_files(self.root, self.cache_path)
+        self.profile_files = list(profile_files)
+        self.profile_file_set = set(profile_files)
         self.evidence.add_many(profile_files, "profile_watch")
         source_summary = _empty_source_summary()
         component_roots = self._component_roots(profile_files, source_summary)
@@ -780,7 +786,7 @@ class _ProfileBuilder:
 
     def _has_file(self, component_path: str, name: str) -> bool:
         rel = _join_rel(component_path, name)
-        return _visible_file(self.root, self.ignore, rel)
+        return rel in self.profile_file_set or _visible_file(self.root, self.ignore, rel)
 
     def _existing_names(self, component_path: str, names: Iterable[str]) -> List[str]:
         return sorted(name for name in names if self._has_file(component_path, name))
@@ -1592,8 +1598,14 @@ def _try_incremental_sync(
     ignore = _GitIgnore(root)
     languages = set(cached.get("watch", {}).get("source_summary", {}).get("languages", []))
     watched = set(cached.get("watch", {}).get("files", {}))
+    watched_profile_files = {rel for rel in watched if _is_profile_file(rel)}
     for changed in changed_files:
         if ignore.ignored(changed, is_dir=False):
+            if _is_profile_file(changed) and (
+                changed in watched
+                or (_profile_file_exists(root, changed) and _is_adjacent_profile_evidence_file(changed, watched_profile_files))
+            ):
+                return None
             continue
         if changed in watched or _is_profile_file(changed):
             return None
@@ -1636,24 +1648,34 @@ def _sync_paths_only(
     if reused is not None:
         return reused
 
+    if ".gitignore" in changed_files:
+        return _paths_only_unavailable(root, cache_path, changed_files, "gitignore_changed_paths_only", "Path-only sync cannot safely apply .gitignore changes; run full sync.")
+
     ignore = _GitIgnore(root)
+    cached_profile_files = {rel for rel in cached.get("watch", {}).get("files", {}) if _is_profile_file(rel)}
     profile_files = {
         rel
-        for rel in cached.get("watch", {}).get("files", {})
-        if _is_profile_file(rel) and _visible_file(root, ignore, rel)
+        for rel in cached_profile_files
+        if _visible_file(root, ignore, rel)
+        or (_profile_file_exists(root, rel) and _is_adjacent_profile_evidence_file(rel, cached_profile_files))
     }
     profile_changed = False
     watched_non_profile_changed = False
     for changed in changed_files:
-        if ignore.ignored(changed, is_dir=False):
-            profile_files.discard(changed)
-            continue
         language = SOURCE_EXTENSIONS.get(Path(changed).suffix)
         if language and language not in set(cached.get("watch", {}).get("source_summary", {}).get("languages", [])):
             return _paths_only_unavailable(root, cache_path, changed_files, "new_source_language_paths_only", "Changed files introduce a source language not present in cache; run full sync.")
         if _is_profile_file(changed):
+            if changed in cached_profile_files and not _profile_file_exists(root, changed):
+                profile_changed = True
+                profile_files.discard(changed)
+                continue
+            visible = _visible_file(root, ignore, changed)
+            adjacent_evidence = _profile_file_exists(root, changed) and _is_adjacent_profile_evidence_file(changed, profile_files | cached_profile_files)
+            if not visible and not adjacent_evidence:
+                continue
             profile_changed = True
-            if _visible_file(root, ignore, changed):
+            if visible or adjacent_evidence:
                 profile_files.add(changed)
             else:
                 profile_files.discard(changed)
@@ -1662,7 +1684,7 @@ def _sync_paths_only(
 
     if not profile_changed and watched_non_profile_changed:
         profile = copy.deepcopy(cached)
-        _refresh_changed_fingerprints(root, ignore, profile, changed_files)
+        _refresh_changed_fingerprints(root, profile, changed_files)
         _mark_synced(profile, cache_path, changed_files, "paths_only_synced")
         return profile
 
@@ -1672,11 +1694,11 @@ def _sync_paths_only(
     return profile
 
 
-def _refresh_changed_fingerprints(root: Path, ignore: "_GitIgnore", profile: Dict[str, Any], changed_files: Sequence[str]) -> None:
+def _refresh_changed_fingerprints(root: Path, profile: Dict[str, Any], changed_files: Sequence[str]) -> None:
     for rel in changed_files:
         if rel not in profile.get("watch", {}).get("files", {}) and rel not in profile.get("evidence_files", {}):
             continue
-        if ignore.ignored(rel, is_dir=False) or not (root / rel).is_file():
+        if not _profile_file_exists(root, rel):
             profile.get("watch", {}).get("files", {}).pop(rel, None)
             profile.get("evidence_files", {}).pop(rel, None)
             continue
@@ -1734,12 +1756,17 @@ def _paths_only_unavailable(
 def _compare_watch_state(root: Path, cache_path: Path, watch: Dict[str, Any]) -> Dict[str, Any]:
     cached_files = watch.get("files", {}) if isinstance(watch, dict) else {}
     current_profile_files = _discover_profile_files(root, cache_path)
+    current_profile_file_set = set(current_profile_files)
     current_file_set = set(current_profile_files) | set(cached_files.keys())
     ignore = _GitIgnore(root)
     current_files = {
         rel: _fingerprint_with_rel(root, rel)
         for rel in sorted(current_file_set)
-        if rel != _rel_to_root(root, cache_path) and _visible_file(root, ignore, rel)
+        if rel != _rel_to_root(root, cache_path)
+        and (
+            (rel in current_profile_file_set and _profile_file_exists(root, rel))
+            or _visible_file(root, ignore, rel)
+        )
     }
     cached_file_set = set(cached_files.keys())
     current_existing_set = set(current_files.keys())
@@ -1763,14 +1790,50 @@ def _changed_file_affects_profile(path: str, profile: Dict[str, Any]) -> bool:
 
 def _discover_profile_files(root: Path, cache_path: Path) -> List[str]:
     cache_rel = _rel_to_root(root, cache_path)
-    files = []
+    files: Set[str] = set()
     for file_path in _walk_files(root):
         rel = _rel_to_root(root, file_path)
         if rel == cache_rel:
             continue
         if _is_profile_file(rel):
-            files.append(rel)
-    return sorted(set(files))
+            files.add(rel)
+    files.update(_discover_adjacent_profile_files(root, cache_rel, files))
+    return sorted(files)
+
+
+def _discover_adjacent_profile_files(root: Path, cache_rel: str, profile_files: Set[str]) -> Set[str]:
+    files: Set[str] = set()
+    component_dirs = {_dirname_rel(rel) for rel in profile_files if _is_component_manifest(rel)}
+    for component_dir in component_dirs:
+        base = root if component_dir == "." else root / component_dir
+        if not base.is_dir() or _is_ignored_generated_dir(base, root):
+            continue
+        for name in ADJACENT_PROFILE_FILE_NAMES:
+            rel = _join_rel(component_dir, name)
+            if rel == cache_rel:
+                continue
+            path = root / rel
+            if path.is_file():
+                files.add(rel)
+        for child in base.iterdir():
+            if child.is_file():
+                rel = _rel_to_root(root, child)
+                if rel != cache_rel and _is_dotnet_manifest(rel):
+                    files.add(rel)
+    return files
+
+
+def _is_adjacent_profile_evidence_file(rel_path: str, profile_files: Set[str]) -> bool:
+    rel = _clean_rel(rel_path)
+    if Path(rel).name not in ADJACENT_PROFILE_FILE_NAMES:
+        return False
+    component_dir = _dirname_rel(rel)
+    return any(_dirname_rel(profile_file) == component_dir and _is_component_manifest(profile_file) for profile_file in profile_files)
+
+
+def _is_ignored_generated_dir(path: Path, root: Path) -> bool:
+    rel = _rel_to_root(root, path)
+    return any(part in IGNORED_DIRS for part in rel.split("/") if part)
 
 
 def _source_summary(root: Path) -> Dict[str, Any]:
@@ -2475,6 +2538,11 @@ def _fingerprint_with_rel(root: Path, rel_path: str) -> Dict[str, Any]:
 def _visible_file(root: Path, ignore: _GitIgnore, rel_path: str) -> bool:
     rel = _clean_rel(rel_path)
     return (root / rel).is_file() and not ignore.ignored(rel, is_dir=False)
+
+
+def _profile_file_exists(root: Path, rel_path: str) -> bool:
+    rel = _clean_rel(rel_path)
+    return (root / rel).is_file()
 
 
 def _resolve_root(root: str | os.PathLike[str]) -> Path:

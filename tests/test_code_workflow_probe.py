@@ -378,6 +378,33 @@ def test_sync_paths_only_updates_profile_file_without_repo_discovery(tmp_path, m
     assert [item["kind"] for item in app["workflows"]] == ["install", "test"]
 
 
+def test_sync_paths_only_adds_ignored_adjacent_lockfile(tmp_path, monkeypatch):
+    write(tmp_path / ".gitignore", "uv.lock\n")
+    write(tmp_path / "pyproject.toml", "[project]\nname='demo'\n")
+    cache = tmp_path / "cache.json"
+    first = probe.sync(tmp_path, cache, format="json")
+
+    def fail_discovery(*args, **kwargs):
+        raise AssertionError("paths-only sync should not discover the whole repo")
+
+    monkeypatch.setattr(probe, "_discover_profile_files", fail_discovery)
+
+    write(tmp_path / "uv.lock", "version = 1\n")
+    updated = probe.sync(
+        tmp_path,
+        cache,
+        changed_files=["uv.lock"],
+        paths_only=True,
+        format="json",
+    )
+
+    root = component(updated, "root")
+    assert component(first, "root")["package_manager"]["name"] == "pip"
+    assert updated["alignment"]["reason"] == "paths_only_synced"
+    assert "uv.lock" in updated["watch"]["files"]
+    assert root["package_manager"]["name"] == "uv"
+
+
 def test_sync_paths_only_requires_existing_cache(tmp_path):
     result = probe.sync(
         tmp_path,
@@ -587,17 +614,40 @@ def test_gitignore_filters_profile_inputs_and_is_watched(tmp_path):
     assert {item["id"] for item in profile["project"]["components"]} == {"app"}
     assert ".gitignore" in profile["evidence_files"]
     assert "ignored/package.json" not in profile["watch"]["files"]
-    assert "app/package-lock.json" not in profile["watch"]["files"]
+    assert "app/package-lock.json" in profile["watch"]["files"]
 
     app = component(profile, "app")
     assert app["package_manager"]["name"] == "npm"
-    assert app["package_manager"]["confidence"] == "medium"
+    assert app["package_manager"]["confidence"] == "high"
 
     write(tmp_path / ".gitignore", "ignored/\napp/package-lock.json\napp/\n")
     status = probe.status(tmp_path, cache, format="json")
 
     assert status["alignment"]["aligned"] is False
     assert ".gitignore" in status["alignment"]["stale_files"]
+
+
+def test_ignored_lockfile_still_counts_as_adjacent_profile_evidence(tmp_path):
+    write(tmp_path / ".gitignore", "uv.lock\n")
+    write(
+        tmp_path / "pyproject.toml",
+        "\n".join(
+            [
+                "[project]",
+                'dependencies=["pytest"]',
+                "[tool.pytest.ini_options]",
+                'testpaths=["tests"]',
+            ]
+        ),
+    )
+    write(tmp_path / "uv.lock", "version = 1\n")
+
+    profile = probe.sync(tmp_path, tmp_path / "cache.json", format="json")
+    root = component(profile, "root")
+
+    assert "uv.lock" in profile["watch"]["files"]
+    assert root["package_manager"]["name"] == "uv"
+    assert workflows(root, "install")[0]["command"] == "uv sync"
 
 
 def test_risky_local_and_ci_workflows_are_not_safe_auto(tmp_path):

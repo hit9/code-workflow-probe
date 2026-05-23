@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4 - 2026-05-23
+
+- Included adjacent lock/config evidence files next to discovered manifests even when those files are ignored by `.gitignore`.
+- Fixed package manager detection for ignored lockfiles such as `uv.lock` and `package-lock.json`.
+
 ## 0.1.3 - 2026-05-23
 
 - Improved default text output readability with stable `summary`, `components`, and workflow sections.
