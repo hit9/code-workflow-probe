@@ -2,7 +2,7 @@
 """code-workflow-probe: deterministic repo workflow profile syncer.
 
 API:
-    sync(root=".", cache_path=None, changed_files=None, write=True, format="text", verbose=False)
+    sync(root=".", cache_path=None, changed_files=None, write=True, format="text", verbose=False, incremental=True, progress=None)
     status(root=".", cache_path=None, format="text", verbose=False)
     edit(root=".", changed_files=None, cache_path=None, format="text", verbose=False)
     affected(root=".", changed_files=None, cache_path=None, format="text", verbose=False)
@@ -28,7 +28,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 try:
     import tomllib
@@ -219,15 +219,35 @@ def sync(
     write: bool = True,
     format: str = "text",
     verbose: bool = False,
+    incremental: bool = True,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any] | str:
     """Build an aligned workflow profile and optionally write it to cache."""
 
     root_path = _resolve_root(root)
     cache = _resolve_cache_path(root_path, cache_path)
+    normalized = _normalize_changed_files(root_path, changed_files or [])
+    _emit_progress(progress, "sync: start")
+
+    if incremental:
+        _emit_progress(progress, "sync: check cache")
+        cached = _load_json(cache)
+        reused = _try_incremental_sync(root_path, cache, cached, normalized)
+        if reused is not None:
+            _emit_progress(progress, "sync: reused cached profile")
+            if write:
+                _write_json(cache, reused)
+                _emit_progress(progress, "sync: wrote cache")
+            _emit_progress(progress, "sync: done")
+            return _format_result(reused, format, verbose=verbose)
+
+    _emit_progress(progress, "sync: scan repo")
     builder = _ProfileBuilder(root_path, cache)
-    profile = builder.build(changed_files=changed_files)
+    profile = builder.build(changed_files=normalized)
     if write:
         _write_json(cache, profile)
+        _emit_progress(progress, "sync: wrote cache")
+    _emit_progress(progress, "sync: done")
     return _format_result(profile, format, verbose=verbose)
 
 
@@ -1153,6 +1173,47 @@ def _affected_from_profile(root: Path, profile: Dict[str, Any], changed_files: S
     }
 
 
+def _try_incremental_sync(
+    root: Path,
+    cache_path: Path,
+    cached: Optional[Dict[str, Any]],
+    changed_files: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    if not cached or not changed_files:
+        return None
+    if cached.get("schema_version") != SCHEMA_VERSION or cached.get("root") != str(root):
+        return None
+    if not cached.get("alignment", {}).get("aligned"):
+        return None
+
+    ignore = _GitIgnore(root)
+    languages = set(cached.get("watch", {}).get("source_summary", {}).get("languages", []))
+    watched = set(cached.get("watch", {}).get("files", {}))
+    for changed in changed_files:
+        if ignore.ignored(changed, is_dir=False):
+            continue
+        if changed in watched or _is_profile_file(changed):
+            return None
+        language = SOURCE_EXTENSIONS.get(Path(changed).suffix)
+        if language and language not in languages:
+            return None
+
+    profile = dict(cached)
+    profile["generated_at"] = _utc_now()
+    profile["cache_path"] = str(cache_path)
+    profile["changed_files"] = list(changed_files)
+    profile["alignment"] = {
+        "aligned": True,
+        "reason": "incremental_reuse",
+        "checked_at": _utc_now(),
+        "stale_files": [],
+        "new_profile_files": [],
+        "removed_profile_files": [],
+        "source_summary_changed": False,
+    }
+    return profile
+
+
 def _compare_watch_state(root: Path, cache_path: Path, watch: Dict[str, Any]) -> Dict[str, Any]:
     cached_files = watch.get("files", {}) if isinstance(watch, dict) else {}
     current_profile_files = _discover_profile_files(root, cache_path)
@@ -1788,6 +1849,15 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _emit_progress(progress: Optional[Callable[[str], None]], message: str) -> None:
+    if progress is not None:
+        progress(message)
+
+
+def _stderr_progress(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
 def _format_result(data: Dict[str, Any], output_format: str, verbose: bool = False) -> Dict[str, Any] | str:
     fmt = _normalize_output_format(output_format)
     if fmt == "json":
@@ -2036,14 +2106,16 @@ Use `code-workflow-probe` when working in a repository and you need current, evi
    `code-workflow-probe sync --root <repo> --format json`
 4. After editing files, notify the probe:
    `code-workflow-probe edit --root <repo> --changed <path> [<path>...]`
-5. Before validation, map changes to components and workflows:
+5. To update via incremental sync after known edits, pass the changed files:
+   `code-workflow-probe sync --root <repo> --changed <path> [<path>...]`
+6. Before validation, map changes to components and workflows:
    `code-workflow-probe affected --root <repo> --changed <path> [<path>...]`
-6. If status says the profile is not aligned, run sync before trusting workflow conclusions:
+7. If status says the profile is not aligned, run sync before trusting workflow conclusions:
    `code-workflow-probe status --root <repo>`
 
 ## Important Sync Rule
 
-Strongly prefer running `code-workflow-probe sync --root <repo>` after editing project or workflow management files, including manifests, lockfiles, package-manager files, task-runner files, CI files, test/lint/format/build config, and monorepo/component boundary files.
+Strongly prefer running `code-workflow-probe sync --root <repo> --changed <path> [<path>...]` after editing project or workflow management files, including manifests, lockfiles, package-manager files, task-runner files, CI files, test/lint/format/build config, and monorepo/component boundary files.
 
 Examples include `package.json`, lockfiles, `pyproject.toml`, `requirements*.txt`, `go.mod`, `Cargo.toml`, `pom.xml`, Gradle files, `Makefile`, `justfile`, `.github/workflows/*`, `.gitlab-ci.yml`, `pytest.ini`, `ruff.toml`, ESLint config, Prettier config, and similar workflow evidence files.
 
@@ -2064,6 +2136,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--format", choices=("text", "json"), default="text", help="Output format. Defaults to text.")
     parser.add_argument("--compact", action="store_true", help="Emit compact JSON when --format json is used.")
     parser.add_argument("--verbose", action="store_true", help="Expand text output with full evidence details.")
+    parser.add_argument("--progress", action="store_true", help="Print progress messages to stderr.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_common(subparser: argparse.ArgumentParser) -> None:
@@ -2072,11 +2145,13 @@ def _build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--format", choices=("text", "json"), default=argparse.SUPPRESS, help="Output format. Defaults to text.")
         subparser.add_argument("--compact", action="store_true", default=argparse.SUPPRESS, help="Emit compact JSON when --format json is used.")
         subparser.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help="Expand text output with full evidence details.")
+        subparser.add_argument("--progress", action="store_true", default=argparse.SUPPRESS, help="Print progress messages to stderr.")
 
     sync_parser = subparsers.add_parser("sync", help="Build and cache an aligned profile.")
     add_common(sync_parser)
     sync_parser.add_argument("--changed", nargs="*", default=[], help="Changed files to include in output context.")
     sync_parser.add_argument("--no-write", action="store_true", help="Do not write cache.")
+    sync_parser.add_argument("--full", action="store_true", help="Force a full repo scan instead of incremental cache reuse.")
 
     status_parser = subparsers.add_parser("status", help="Check whether cached profile is aligned.")
     add_common(status_parser)
@@ -2102,9 +2177,19 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    progress = _stderr_progress if args.progress else None
 
     if args.command == "sync":
-        output = sync(args.root, args.cache, changed_files=args.changed, write=not args.no_write, format=args.format, verbose=args.verbose)
+        output = sync(
+            args.root,
+            args.cache,
+            changed_files=args.changed,
+            write=not args.no_write,
+            format=args.format,
+            verbose=args.verbose,
+            incremental=not args.full,
+            progress=progress,
+        )
     elif args.command == "status":
         output = status(args.root, args.cache, format=args.format, verbose=args.verbose)
     elif args.command == "edit":

@@ -148,6 +148,67 @@ def test_status_and_edit_hook_resync_only_profile_affecting_changes(tmp_path):
     assert [item["kind"] for item in manifest_edit["suggested_workflows"]] == ["test", "lint"]
 
 
+def test_sync_incremental_reuses_cache_for_non_profile_changes(tmp_path):
+    cache = make_mixed_repo(tmp_path)
+    first = probe.sync(tmp_path, cache, format="json")
+    events = []
+
+    write(tmp_path / "app" / "src" / "main.ts", "const x: number = 3\n")
+    reused = probe.sync(
+        tmp_path,
+        cache,
+        changed_files=["app/src/main.ts"],
+        format="json",
+        progress=events.append,
+    )
+
+    assert first["project"] == reused["project"]
+    assert reused["alignment"]["reason"] == "incremental_reuse"
+    assert "sync: reused cached profile" in events
+
+    write(tmp_path / "app" / "package.json", json.dumps({"scripts": {"test": "vitest run"}}))
+    rebuilt = probe.sync(tmp_path, cache, changed_files=["app/package.json"], format="json")
+
+    assert rebuilt["alignment"]["reason"] == "synced"
+    assert rebuilt["project"] != first["project"]
+
+
+def test_cli_progress_uses_stderr(tmp_path):
+    cache = make_mixed_repo(tmp_path)
+    script = Path(probe.__file__).resolve()
+    subprocess.run(
+        [sys.executable, str(script), "sync", "--root", str(tmp_path), "--cache", str(cache), "--format", "json"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "sync",
+            "--root",
+            str(tmp_path),
+            "--cache",
+            str(cache),
+            "--changed",
+            "app/src/main.ts",
+            "--progress",
+            "--format",
+            "json",
+            "--compact",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(result.stdout)["alignment"]["reason"] == "incremental_reuse"
+    assert "sync: start" in result.stderr
+    assert "sync: reused cached profile" in result.stderr
+
+
 def test_affected_maps_files_to_components_and_local_workflows(tmp_path):
     cache = make_mixed_repo(tmp_path)
     probe.sync(tmp_path, cache, format="json")

@@ -29,6 +29,14 @@ code-workflow-probe sync --root . --format json
 
 Use `--verbose` when you need full evidence and fingerprints.
 
+Use `sync --changed ...` for incremental cache reuse after known file edits:
+
+```bash
+code-workflow-probe sync --root . --changed src/app.py
+```
+
+Use `--progress` to print sync progress to stderr, and `--full` to force a full scan.
+
 ## Python API
 
 ```python
@@ -38,10 +46,10 @@ from code_workflow_probe import affected, edit, install_skill, status, sync
 APIs return concise text by default. Pass `format="json"` to get dictionaries.
 
 ```python
-sync(root=".", cache_path=None, changed_files=None, write=True, format="text", verbose=False)
+sync(root=".", cache_path=None, changed_files=None, write=True, format="text", verbose=False, incremental=True, progress=None)
 ```
 
-Build an aligned profile and optionally write the cache.
+Build an aligned profile and optionally write the cache. With `changed_files`, it can reuse an aligned cache when the changes do not affect profile evidence.
 
 ```python
 status(root=".", cache_path=None, format="text", verbose=False)
