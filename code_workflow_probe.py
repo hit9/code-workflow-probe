@@ -40,7 +40,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback.
     tomllib = None  # type: ignore[assignment]
 
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 SCHEMA_VERSION = 1
 DEFAULT_CACHE_NAME = ".code-workflow-probe.json"
 SKILL_NAME = "code-workflow-probe"
@@ -2683,14 +2683,12 @@ def _render_status_text(
         workflows = [workflow for component in components for workflow in component.get("workflows", [])]
         safe = sum(1 for workflow in workflows if workflow.get("safe_auto"))
         review = len(workflows) - safe
-        lines.append(
-            f"profile: type={project.get('type', 'unknown')} "
-            f"components={len(components)} tech={_format_fact_names(project.get('technologies', []))} "
-            f"pm={_format_package_managers(project.get('package_managers', []))}"
-        )
-        lines.append(
-            f"workflows: safe_auto={safe} needs_review={review} ci={len(project.get('ci_workflows', []))}"
-        )
+        lines.append("summary:")
+        lines.append(f"- project: {project.get('type', 'unknown')}")
+        lines.append(f"- components: {len(components)}")
+        lines.append(f"- tech: {_format_fact_names(project.get('technologies', []))}")
+        lines.append(f"- package_managers: {_format_package_managers(project.get('package_managers', []))}")
+        lines.append(f"- workflows: safe_auto={safe} needs_review={review} ci={len(project.get('ci_workflows', []))}")
         if detail == "compact":
             _append_status_workflows(lines, components, preview_limit, include_component=True)
         elif detail == "standard":
@@ -2845,11 +2843,10 @@ def _status_workflow_sort_key(item: Dict[str, Any]) -> Tuple[int, str, int, int,
 def _append_profile_text(lines: List[str], profile: Dict[str, Any], verbose: bool = False) -> None:
     project = profile.get("project", {})
     components = project.get("components", [])
-    lines.append(
-        f"project: {project.get('type', 'unknown')}; "
-        f"tech={_format_fact_names(project.get('technologies', []), verbose=verbose)}; "
-        f"pm={_format_package_managers(project.get('package_managers', []), verbose=verbose)}"
-    )
+    lines.append("summary:")
+    lines.append(f"- project: {project.get('type', 'unknown')}")
+    lines.append(f"- tech: {_format_fact_names(project.get('technologies', []), verbose=verbose)}")
+    lines.append(f"- package_managers: {_format_package_managers(project.get('package_managers', []), verbose=verbose)}")
     lines.append("components:")
     if not components:
         lines.append("- none")
@@ -2913,11 +2910,11 @@ def _append_workflow_groups(lines: List[str], workflows: Sequence[Dict[str, Any]
     safe = [workflow for workflow in workflows if workflow.get("safe_auto")]
     review = [workflow for workflow in workflows if not workflow.get("safe_auto")]
     if safe:
-        lines.append(f"{indent}safe_auto:")
+        lines.append(f"{indent}workflows.safe_auto:")
         for workflow in safe:
             lines.append(f"{indent}- {_format_workflow(workflow, verbose=verbose)}")
     if review:
-        lines.append(f"{indent}needs_review:")
+        lines.append(f"{indent}workflows.needs_review:")
         for workflow in review[:8]:
             lines.append(f"{indent}- {_format_workflow(workflow, verbose=verbose)}")
         if len(review) > 8:

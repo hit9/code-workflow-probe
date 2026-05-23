@@ -40,6 +40,7 @@ code-workflow-probe sync --root . --format json
 The default text format is optimized as bounded context for AI coding tools:
 
 - It starts with alignment so stale profiles are not silently trusted.
+- It uses stable sections such as `summary`, `components`, `workflows.safe_auto`, `workflows.needs_review`, and `evidence`.
 - It names project type, tech stack, package manager, component path, and workflow `cwd`.
 - It includes concrete local workflow commands for install, test, lint, format, build, and dev when evidence supports them.
 - It marks non-obvious execution safety with `candidate`, `risk=...`, `conf=...`, and `ci-only` notes.

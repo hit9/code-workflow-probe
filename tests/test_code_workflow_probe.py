@@ -137,8 +137,10 @@ def test_api_default_format_is_text_and_json_format_returns_dict(tmp_path):
     assert data["alignment"]["aligned"] is True
     assert isinstance(status_text, str)
     assert "status: aligned=true" in status_text
-    assert "profile: type=multi-component components=2" in status_text
-    assert "workflows: safe_auto=" in status_text
+    assert "summary:" in status_text
+    assert "- project: multi-component" in status_text
+    assert "- components: 2" in status_text
+    assert "- workflows: safe_auto=" in status_text
     assert "workflows(local, shown=" in status_text
     assert "component=app test: cwd=app command=pnpm run test" in status_text
     assert "component=app lint: cwd=app command=pnpm run lint" in status_text

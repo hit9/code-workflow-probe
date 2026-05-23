@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3 - 2026-05-23
+
+- Improved default text output readability with stable `summary`, `components`, and workflow sections.
+
 ## 0.1.2 - 2026-05-23
 
 - Added `status --detail compact|standard|full`, `--depth`, and `--limit` for bounded AI-focused status output with workflow command previews.
