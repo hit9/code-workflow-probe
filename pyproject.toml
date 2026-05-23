@@ -1,0 +1,25 @@
+[project]
+name = "code-workflow-probe"
+version = "0.1.0"
+description = "Deterministic repo workflow profile syncer for AI coding tools."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+code-workflow-probe = "code_workflow_probe:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.hatch.build.targets.wheel]
+py-modules = ["code_workflow_probe"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
