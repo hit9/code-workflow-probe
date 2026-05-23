@@ -80,6 +80,8 @@ def test_api_default_format_is_text_and_json_format_returns_dict(tmp_path):
     assert isinstance(text, str)
     assert "sync: aligned=true" in text
     assert "components:" in text
+    assert "test: cwd=app command=pnpm run test" in text
+    assert " @ " not in text
     assert "evidence_files:" not in text
     assert isinstance(data, dict)
     assert data["alignment"]["aligned"] is True

@@ -1953,7 +1953,7 @@ def _format_workflow(workflow: Dict[str, Any], verbose: bool = False) -> str:
         if workflow.get("ci_only"):
             notes.append("ci-only")
         suffix = f" [{' '.join(notes)}]" if notes else ""
-        return f"{workflow.get('kind')}: {workflow.get('command') or 'none'} @ {workflow.get('cwd') or '?'}{suffix}"
+        return f"{workflow.get('kind')}: cwd={workflow.get('cwd') or '?'} command={workflow.get('command') or 'none'}{suffix}"
     return (
         f"kind={workflow.get('kind')} "
         f"command={workflow.get('command') or 'none'} "
